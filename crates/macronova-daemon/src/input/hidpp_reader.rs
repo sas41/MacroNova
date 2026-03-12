@@ -14,7 +14,10 @@
 //! when the device is in HID++ notification mode.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -53,10 +56,16 @@ const HIDPP_USAGE_PAGE: u16 = 0xFF00;
 /// 1. Opens the HID++ vendor channel for the first Logitech device found.
 /// 2. Enumerates buttons and diverts those whose CIDs match `cids_to_divert`.
 /// 3. Reads REPROG_CONTROLS_V4 notifications and sends `HidppButtonEvent`s on `tx`.
-/// 4. On thread exit (channel closed), un-diverts all CIDs it diverted.
+/// 4. On thread exit (channel closed or device lost), un-diverts all CIDs it diverted.
+///
+/// `alive` is set to `false` when the thread exits so callers can detect device loss.
 ///
 /// Returns `Ok(())` if the thread was spawned, `Err` if no suitable device was found.
-pub fn spawn(cids_to_divert: HashSet<u16>, tx: mpsc::Sender<HidppButtonEvent>) -> Result<()> {
+pub fn spawn(
+    cids_to_divert: HashSet<u16>,
+    tx: mpsc::Sender<HidppButtonEvent>,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
     let (hidraw_path, device_index) = find_hidpp_channel()
         .context("No Logitech HID++ device found — HID++ notification path unavailable")?;
 
@@ -67,12 +76,15 @@ pub fn spawn(cids_to_divert: HashSet<u16>, tx: mpsc::Sender<HidppButtonEvent>) -
         cids_to_divert.len()
     );
 
+    alive.store(true, Ordering::Relaxed);
+
     std::thread::Builder::new()
         .name("macronova-hidpp".into())
         .spawn(move || {
             if let Err(e) = run_reader(hidraw_path, device_index, cids_to_divert, tx) {
                 warn!("HID++ reader exited: {e}");
             }
+            alive.store(false, Ordering::Relaxed);
         })
         .context("Failed to spawn HID++ reader thread")?;
 
@@ -224,8 +236,9 @@ fn run_reader(
                 }
             }
             Err(e) => {
-                warn!("HID++ read error: {e}");
-                std::thread::sleep(Duration::from_millis(100));
+                warn!("HID++ read error: {e} — device lost, exiting reader thread");
+                // Exit so the main loop can detect the thread is gone and re-spawn.
+                return Err(e.into());
             }
         }
     }

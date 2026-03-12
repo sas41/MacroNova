@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::device::evdev_input::discover_evdev_paths;
+
 /// Top-level configuration loaded from `~/.config/macronova/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -54,11 +56,66 @@ pub struct ButtonBinding {
 
 impl Config {
     /// Load configuration from the given path.
+    ///
+    /// Button names using the legacy `eventN/key0x...` format are automatically
+    /// migrated to the stable by-id label format on load.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+        let mut cfg: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        cfg.migrate_event_node_names();
+        Ok(cfg)
+    }
+
+    /// Rewrite any button names still using the legacy `eventN/key0x...` format
+    /// to the stable by-id symlink label.
+    ///
+    /// This is a best-effort migration: if `discover_evdev_paths()` returns
+    /// `None` (device not plugged in at load time) the names are left unchanged.
+    fn migrate_event_node_names(&mut self) {
+        let paths = match discover_evdev_paths() {
+            Some(p) => p,
+            None => return, // device absent — cannot migrate right now
+        };
+
+        // Build a table: eventN_basename -> stable label, for each discovered node.
+        let mut node_map: HashMap<String, String> = HashMap::new();
+        for (path, label) in [
+            (paths.mouse_path.as_str(), paths.mouse_label.as_str()),
+            (paths.kbd_path.as_str(), paths.kbd_label.as_str()),
+        ] {
+            if path.is_empty() || label.is_empty() {
+                continue;
+            }
+            let basename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string();
+            node_map.insert(basename, label.to_string());
+        }
+
+        if node_map.is_empty() {
+            return;
+        }
+
+        for device in self.device.values_mut() {
+            for binding in &mut device.bindings {
+                if let Some(ref name) = binding.button {
+                    // Match "eventN/key0x..." where "eventN" is a pure eventN basename.
+                    if let Some((node, rest)) = name.split_once('/') {
+                        let is_legacy = node.starts_with("event")
+                            && node[5..].chars().all(|c| c.is_ascii_digit());
+                        if is_legacy {
+                            if let Some(label) = node_map.get(node) {
+                                binding.button = Some(format!("{label}/{rest}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Load configuration from the default location (`~/.config/macronova/config.toml`).

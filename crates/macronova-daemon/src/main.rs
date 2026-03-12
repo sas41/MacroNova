@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use macronova_core::{
     config::{default_config_dir, Config},
-    device::evdev_input::{discover_evdev_paths, EvdevReader},
+    device::evdev_input::{discover_evdev_paths, EvdevPaths, EvdevReader},
 };
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -20,6 +20,46 @@ use tracing_subscriber::EnvFilter;
 use crate::input::hidpp_reader::{cid_from_button_name, spawn as spawn_hidpp, HidppButtonEvent};
 use crate::input::uinput::UInputDevice;
 use crate::input::xtest::MouseInjector;
+
+/// Try to discover and open an evdev reader.  Returns `None` if the device is
+/// not present yet (caller should retry later).
+fn try_open_reader() -> Option<EvdevReader> {
+    let paths = discover_evdev_paths().or_else(|| {
+        warn!("Could not discover evdev paths via by-id; trying event5/event6 fallback");
+        Some(EvdevPaths {
+            mouse_path: "/dev/input/event5".into(),
+            kbd_path: "/dev/input/event6".into(),
+            mouse_label: String::new(), // will fall back to eventN basename
+            kbd_label: String::new(),
+        })
+    })?;
+
+    let devices: Vec<(&str, &str)> = if paths.kbd_path.is_empty() {
+        vec![(paths.mouse_path.as_str(), paths.mouse_label.as_str())]
+    } else {
+        vec![
+            (paths.mouse_path.as_str(), paths.mouse_label.as_str()),
+            (paths.kbd_path.as_str(), paths.kbd_label.as_str()),
+        ]
+    };
+
+    match EvdevReader::open(&devices) {
+        Ok(r) => {
+            info!(
+                "evdev reader opened: mouse={} (label={}), kbd={} (label={})",
+                paths.mouse_path, paths.mouse_label, paths.kbd_path, paths.kbd_label
+            );
+            Some(r)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to open evdev reader ({}, {}): {e}",
+                paths.mouse_path, paths.kbd_path
+            );
+            None
+        }
+    }
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -47,27 +87,6 @@ fn main() -> Result<()> {
         info!("Watching config directory: {}", config_dir.display());
     }
 
-    // Discover evdev paths via /dev/input/by-id symlinks.
-    let (mouse_path, kbd_path) = discover_evdev_paths()
-        .map(|(m, k)| {
-            info!("Discovered evdev paths: mouse={m}, kbd={k}");
-            (m, k)
-        })
-        .unwrap_or_else(|| {
-            warn!("Could not discover evdev paths via by-id; trying event5/event6 fallback");
-            ("/dev/input/event5".into(), "/dev/input/event6".into())
-        });
-
-    let paths: Vec<&str> = if kbd_path.is_empty() {
-        vec![mouse_path.as_str()]
-    } else {
-        vec![mouse_path.as_str(), kbd_path.as_str()]
-    };
-
-    let mut reader = EvdevReader::open(&paths)
-        .with_context(|| format!("Failed to open evdev reader ({mouse_path}, {kbd_path})"))?;
-    info!("evdev reader opened — listening for button events");
-
     // Collect CIDs for all bound buttons that use the cid/0x... naming scheme.
     let cids_to_divert: HashSet<u16> = {
         let cfg = config.lock().unwrap();
@@ -80,13 +99,33 @@ fn main() -> Result<()> {
     };
 
     // Spawn the HID++ reader thread if there are any CID-based bindings.
+    // `hidpp_alive` is cleared by the thread on exit so we can re-spawn after reconnect.
     let (hidpp_tx, hidpp_rx) = std::sync::mpsc::channel::<HidppButtonEvent>();
+    let hidpp_alive = Arc::new(AtomicBool::new(false));
     if !cids_to_divert.is_empty() {
         info!("Spawning HID++ reader for {} CID binding(s)", cids_to_divert.len());
-        if let Err(e) = spawn_hidpp(cids_to_divert, hidpp_tx) {
+        if let Err(e) = spawn_hidpp(cids_to_divert.clone(), hidpp_tx.clone(), Arc::clone(&hidpp_alive)) {
             warn!("HID++ reader unavailable: {e} — falling back to evdev only");
         }
     }
+
+    // Initial device open — wait indefinitely with backoff until the device
+    // appears (handles the case where the daemon starts before the dongle is
+    // plugged in).
+    let mut reconnect_delay = Duration::from_millis(500);
+    let mut reader: Option<EvdevReader> = None;
+    while reader.is_none() {
+        match try_open_reader() {
+            Some(r) => reader = Some(r),
+            None => {
+                info!("Waiting for evdev device — retrying in {}ms", reconnect_delay.as_millis());
+                std::thread::sleep(reconnect_delay);
+                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+    let mut reader = reader.unwrap();
+    reconnect_delay = Duration::from_millis(500); // reset for future reconnects
 
     let mut active_held: HashMap<String, Arc<AtomicBool>> = HashMap::new();
 
@@ -133,8 +172,12 @@ fn main() -> Result<()> {
 
         // Poll evdev (blocks up to 100ms).
         match reader.poll(Duration::from_millis(100)) {
-            Ok(None) => continue,
+            Ok(None) => {
+                reconnect_delay = Duration::from_millis(500); // device is alive; reset backoff
+                continue;
+            }
             Ok(Some(ev)) => {
+                reconnect_delay = Duration::from_millis(500); // device is alive; reset backoff
                 let name = ev.button.name();
                 if ev.pressed {
                     handle_button_down(
@@ -155,8 +198,45 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                error!("evdev read error: {}", e);
-                std::thread::sleep(Duration::from_millis(100));
+                // The device was unplugged or an unrecoverable I/O error occurred.
+                // Drop the dead reader and attempt to reopen with exponential backoff.
+                error!("evdev read error (device lost?): {e} — attempting reconnect");
+                drop(reader);
+
+                loop {
+                    std::thread::sleep(reconnect_delay);
+                    reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(5));
+
+                    match try_open_reader() {
+                        Some(new_reader) => {
+                            info!("evdev device reconnected — resuming");
+                            reader = new_reader;
+                            reconnect_delay = Duration::from_millis(500);
+
+                            // Re-spawn the HID++ reader if it exited due to device loss.
+                            if !cids_to_divert.is_empty()
+                                && !hidpp_alive.load(Ordering::Relaxed)
+                            {
+                                info!("Re-spawning HID++ reader after reconnect");
+                                if let Err(e) = spawn_hidpp(
+                                    cids_to_divert.clone(),
+                                    hidpp_tx.clone(),
+                                    Arc::clone(&hidpp_alive),
+                                ) {
+                                    warn!("HID++ reader still unavailable: {e}");
+                                }
+                            }
+
+                            break;
+                        }
+                        None => {
+                            info!(
+                                "Device not yet available — retrying in {}ms",
+                                reconnect_delay.as_millis()
+                            );
+                        }
+                    }
+                }
             }
         }
     }

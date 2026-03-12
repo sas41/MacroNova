@@ -1,36 +1,41 @@
 # MacroNova example configuration
 # Copy to ~/.config/macronova/config.toml and edit as needed.
 #
-# Button names use the evdev raw address:  "<eventN>/key0x<HHHH>"
+# Button names use the stable by-id format:  "<by-id-label>/key0x<HHHH>"
 #
-# <eventN>  = basename of the /dev/input/eventN node for your device.
-#             Discovered automatically via /dev/input/by-id/ symlinks.
-# <HHHH>    = 4-digit lowercase hex EV_KEY code.
+# <by-id-label>  = the /dev/input/by-id/ symlink name for your device,
+#                  e.g. "usb-Logitech_USB_Receiver-event-mouse".
+#                  This is stable across reboots and plug/unplug cycles.
+# <HHHH>         = 4-digit lowercase hex EV_KEY code.
 #
-# Use the GUI "Capture" button to discover the exact name for any button.
+# Use the GUI "Capture" button to discover the exact name for any button —
+# it will record the stable by-id label automatically.
 #
-# Common G502 X Lightspeed codes (event5 = mouse node):
-#   event5/key0x0110  BTN_LEFT      (left click)
-#   event5/key0x0111  BTN_RIGHT     (right click)
-#   event5/key0x0112  BTN_MIDDLE    (scroll wheel click)
-#   event5/key0x0113  BTN_SIDE      (back thumb button)
-#   event5/key0x0114  BTN_EXTRA     (forward thumb button)
-#   event5/key0x0115  BTN_FORWARD   (top side button 1)
-#   event5/key0x0116  BTN_BACK      (top side button 2)
-#   event5/key0x0117  code279       (sniper button)
-#   event5/key0x0118  code280       (DPI cycle / extra)
+# Legacy "eventN/key0x..." names are automatically migrated to the stable
+# format when the config is loaded while the device is connected.
+#
+# Common G502 X Lightspeed codes:
+#   .../key0x0110  BTN_LEFT      (left click)
+#   .../key0x0111  BTN_RIGHT     (right click)
+#   .../key0x0112  BTN_MIDDLE    (scroll wheel click)
+#   .../key0x0113  BTN_SIDE      (back thumb button)
+#   .../key0x0114  BTN_EXTRA     (forward thumb button)
+#   .../key0x0115  BTN_FORWARD   (top side button 1)
+#   .../key0x0116  BTN_BACK      (top side button 2)
+#   .../key0x0117  code279       (sniper button)
+#   .../key0x0118  code280       (DPI cycle / extra)
 
 [device.G502X]
 wpid = "407F"
 
 [[device.G502X.bindings]]
-button = "event5/key0x0116"
+button = "usb-Logitech_USB_Receiver-event-mouse/key0x0116"
 on_press = "macros/undo.rhai"
 
 [[device.G502X.bindings]]
-button = "event5/key0x0115"
+button = "usb-Logitech_USB_Receiver-event-mouse/key0x0115"
 on_press = "macros/redo.rhai"
 
 [[device.G502X.bindings]]
-button = "event5/key0x0118"
+button = "usb-Logitech_USB_Receiver-event-mouse/key0x0118"
 on_press = "macros/click_repeat.rhai"

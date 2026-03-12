@@ -113,12 +113,16 @@ pub struct EvdevReader {
 }
 
 impl EvdevReader {
-    /// Open the given evdev paths for read-only, non-blocking access.
+    /// Open the given evdev devices for read-only, non-blocking access.
     ///
-    /// Pass the mouse event path and, optionally, the kbd event path.
-    pub fn open(paths: &[&str]) -> Result<Self> {
+    /// Each entry is `(path, label)` where:
+    /// - `path` is the `/dev/input/eventN` path to open.
+    /// - `label` is the stable name stored in `ButtonId::node` (e.g. the
+    ///   by-id symlink basename).  If empty, the `eventN` basename is used
+    ///   as a fallback.
+    pub fn open(devices: &[(&str, &str)]) -> Result<Self> {
         let mut handles = Vec::new();
-        for &path in paths {
+        for &(path, label) in devices {
             if path.is_empty() {
                 continue;
             }
@@ -134,11 +138,17 @@ impl EvdevReader {
                 let err = std::io::Error::last_os_error();
                 bail!("Failed to open evdev device {path}: {err}");
             }
-            let node = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path)
-                .to_string();
+            // Use the supplied label if non-empty, otherwise fall back to the
+            // eventN basename so nothing breaks when called without by-id info.
+            let node = if !label.is_empty() {
+                label.to_string()
+            } else {
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string()
+            };
             handles.push(DeviceHandle { node, fd });
         }
         if handles.is_empty() {
@@ -224,20 +234,38 @@ impl EvdevReader {
     }
 }
 
+/// Paths and stable labels discovered via `/dev/input/by-id/`.
+///
+/// `mouse_path` / `kbd_path` are canonical `/dev/input/eventN` strings used to
+/// open the fds.  `mouse_label` / `kbd_label` are the by-id symlink basenames
+/// (e.g. `"usb-Logitech_USB_Receiver-event-mouse"`) used as the stable node
+/// name in [`ButtonId`] so that config button names survive replug and reboot.
+#[derive(Debug, Clone, Default)]
+pub struct EvdevPaths {
+    pub mouse_path: String,
+    pub kbd_path: String,
+    /// Stable label derived from the by-id symlink name (used as `ButtonId::node`).
+    pub mouse_label: String,
+    /// Stable label derived from the by-id symlink name (used as `ButtonId::node`).
+    /// Empty string when no kbd node was found.
+    pub kbd_label: String,
+}
+
 /// Discover the evdev paths for the Logitech USB Receiver by scanning
 /// `/dev/input/by-id/` for the well-known symlink names.
 ///
-/// Returns `(mouse_path, kbd_path)` as canonical `/dev/input/eventN` paths.
-/// Falls back to probing `/dev/input/event*` by device name if by-id is absent.
-pub fn discover_evdev_paths() -> Option<(String, String)> {
+/// Returns an [`EvdevPaths`] containing both the canonical `/dev/input/eventN`
+/// paths (for opening fds) and the stable by-id symlink basenames (for use as
+/// `ButtonId` node labels in config files).
+pub fn discover_evdev_paths() -> Option<EvdevPaths> {
     let by_id = std::path::Path::new("/dev/input/by-id");
     if !by_id.exists() {
         return None;
     }
 
     let entries = std::fs::read_dir(by_id).ok()?;
-    let mut mouse_link: Option<String> = None;
-    let mut kbd_link: Option<String> = None;
+    let mut mouse: Option<(String, String)> = None; // (path, label)
+    let mut kbd: Option<(String, String)> = None;
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -246,22 +274,31 @@ pub fn discover_evdev_paths() -> Option<(String, String)> {
         if name.contains("Logitech") && name.contains("USB_Receiver") {
             if name.ends_with("-event-mouse") && !name.contains("-if") {
                 let target = std::fs::read_link(entry.path()).ok()?;
-                // Symlink target is like "../../input/eventN" or "../eventN"
                 let canon = by_id.join(&target);
                 let canon = std::fs::canonicalize(&canon).unwrap_or_else(|_| canon.clone());
-                mouse_link = Some(canon.to_string_lossy().to_string());
+                mouse = Some((canon.to_string_lossy().to_string(), name));
             } else if name.ends_with("-event-kbd") {
                 let target = std::fs::read_link(entry.path()).ok()?;
                 let canon = by_id.join(&target);
                 let canon = std::fs::canonicalize(&canon).unwrap_or_else(|_| canon.clone());
-                kbd_link = Some(canon.to_string_lossy().to_string());
+                kbd = Some((canon.to_string_lossy().to_string(), name));
             }
         }
     }
 
-    match (mouse_link, kbd_link) {
-        (Some(m), Some(k)) => Some((m, k)),
-        (Some(m), None) => Some((m, String::new())),
+    match (mouse, kbd) {
+        (Some((mp, ml)), Some((kp, kl))) => Some(EvdevPaths {
+            mouse_path: mp,
+            kbd_path: kp,
+            mouse_label: ml,
+            kbd_label: kl,
+        }),
+        (Some((mp, ml)), None) => Some(EvdevPaths {
+            mouse_path: mp,
+            kbd_path: String::new(),
+            mouse_label: ml,
+            kbd_label: String::new(),
+        }),
         _ => None,
     }
 }
