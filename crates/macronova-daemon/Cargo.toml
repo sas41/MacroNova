@@ -23,6 +23,7 @@ path = "src/bin/mouse_test.rs"
 
 [dependencies]
 macronova-core = { path = "../macronova-core" }
+hidapi = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 evdev = { workspace = true }

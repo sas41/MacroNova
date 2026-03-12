@@ -1,7 +1,7 @@
 mod engine;
 mod input;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -17,6 +17,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use crate::input::hidpp_reader::{cid_from_button_name, spawn as spawn_hidpp, HidppButtonEvent};
 use crate::input::uinput::UInputDevice;
 use crate::input::xtest::MouseInjector;
 
@@ -67,10 +68,31 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to open evdev reader ({mouse_path}, {kbd_path})"))?;
     info!("evdev reader opened — listening for button events");
 
+    // Collect CIDs for all bound buttons that use the cid/0x... naming scheme.
+    let cids_to_divert: HashSet<u16> = {
+        let cfg = config.lock().unwrap();
+        cfg.device
+            .values()
+            .flat_map(|dc| dc.bindings.iter())
+            .filter_map(|b| b.button.as_deref())
+            .filter_map(cid_from_button_name)
+            .collect()
+    };
+
+    // Spawn the HID++ reader thread if there are any CID-based bindings.
+    let (hidpp_tx, hidpp_rx) = std::sync::mpsc::channel::<HidppButtonEvent>();
+    if !cids_to_divert.is_empty() {
+        info!("Spawning HID++ reader for {} CID binding(s)", cids_to_divert.len());
+        if let Err(e) = spawn_hidpp(cids_to_divert, hidpp_tx) {
+            warn!("HID++ reader unavailable: {e} — falling back to evdev only");
+        }
+    }
+
     let mut active_held: HashMap<String, Arc<AtomicBool>> = HashMap::new();
 
     info!("Entering main event loop");
     loop {
+        // Process config file watcher events.
         while let Ok(Ok(event)) = rx.try_recv() {
             if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                 if event.paths.iter().any(|p| p == &config_path) {
@@ -85,6 +107,31 @@ fn main() -> Result<()> {
             }
         }
 
+        // Drain HID++ notification events (non-blocking).
+        while let Ok(ev) = hidpp_rx.try_recv() {
+            if ev.name.is_empty() {
+                continue; // keepalive sentinel
+            }
+            if ev.pressed {
+                handle_button_down(
+                    &ev.name,
+                    &config,
+                    Arc::clone(&uinput),
+                    Arc::clone(&mouse),
+                    &mut active_held,
+                );
+            } else {
+                handle_button_up(
+                    &ev.name,
+                    &config,
+                    Arc::clone(&uinput),
+                    Arc::clone(&mouse),
+                    &mut active_held,
+                );
+            }
+        }
+
+        // Poll evdev (blocks up to 100ms).
         match reader.poll(Duration::from_millis(100)) {
             Ok(None) => continue,
             Ok(Some(ev)) => {

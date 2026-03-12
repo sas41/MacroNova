@@ -1,8 +1,5 @@
 use egui::{Color32, RichText, Ui};
-use macronova_core::{
-    config::{default_macros_dir, ButtonBinding, Config, DeviceConfig},
-    device::evdev_input::ButtonId,
-};
+use macronova_core::config::{default_macros_dir, ButtonBinding, Config, DeviceConfig};
 
 /// Unique key for a binding row: (device_name, binding_index).
 type RowKey = (String, usize);
@@ -49,14 +46,14 @@ impl BindingsView {
     /// Called by the app when a physical button is pressed.
     /// If we're in capture mode, assign it to the waiting binding row.
     /// Returns true if the event was consumed.
-    pub fn on_button_event(&mut self, button: ButtonId) -> bool {
+    pub fn on_button_event(&mut self, button: String) -> bool {
         if let CaptureState::Waiting(ref key) = self.capture {
             let key = key.clone();
             let device_name = &key.0;
             let idx = key.1;
             if let Some(device_cfg) = self.config.device.get_mut(device_name) {
                 if let Some(binding) = device_cfg.bindings.get_mut(idx) {
-                    binding.button = Some(button.name());
+                    binding.button = Some(button);
                 }
             }
             self.capture = CaptureState::Idle;

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 macronova-core = { path = "../macronova-core" }
+hidapi = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 eframe = { workspace = true }

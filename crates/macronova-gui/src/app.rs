@@ -6,7 +6,7 @@ use egui::{CentralPanel, Context, TopBottomPanel};
 use macronova_core::{
     config::{default_config_path, Config},
     device::{
-        evdev_input::{discover_evdev_paths, ButtonEvent, ButtonId, EvdevReader},
+        evdev_input::{discover_evdev_paths, ButtonEvent, EvdevReader},
         logitech::discover_devices,
         DeviceInfo,
     },
@@ -27,10 +27,11 @@ pub enum Tab {
     Daemon,
 }
 
-/// Live button state fed from the evdev background thread to the UI.
+/// Live button state fed from background threads to the UI.
+/// `button` is the canonical button name string (e.g. `"event5/key0x00c4"` or `"cid/0x00c4"`).
 #[derive(Debug, Clone)]
 pub struct LiveButtonEvent {
-    pub button: ButtonId,
+    pub button: String,
     pub pressed: bool,
 }
 
@@ -41,7 +42,7 @@ pub struct MacroNovaApp {
     pub config_path: std::path::PathBuf,
 
     pub button_rx: mpsc::Receiver<LiveButtonEvent>,
-    pub last_pressed: Option<ButtonId>,
+    pub last_pressed: Option<String>,
 
     pub devices_view: DevicesView,
     pub bindings_view: BindingsView,
@@ -71,12 +72,19 @@ impl MacroNovaApp {
 
         let (btn_tx, btn_rx) = mpsc::channel::<LiveButtonEvent>();
 
-        // Discover evdev paths for the preview thread.
+        // Evdev preview thread.
         let evdev_paths = discover_evdev_paths();
-
+        let btn_tx_evdev = btn_tx.clone();
         std::thread::Builder::new()
             .name("evdev-preview".into())
-            .spawn(move || evdev_preview_thread(evdev_paths, btn_tx))
+            .spawn(move || evdev_preview_thread(evdev_paths, btn_tx_evdev))
+            .ok();
+
+        // HID++ preview thread — produces cid/0x... names for diverted buttons.
+        let btn_tx_hidpp = btn_tx.clone();
+        std::thread::Builder::new()
+            .name("hidpp-preview".into())
+            .spawn(move || hidpp_preview_thread(btn_tx_hidpp))
             .ok();
 
         let bindings_view = BindingsView::new(config.clone());
@@ -174,10 +182,7 @@ impl eframe::App for MacroNovaApp {
                 ui.label(format!("{} device(s) detected", self.devices.len()));
                 if let Some(ref btn) = self.last_pressed {
                     ui.separator();
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!("Last pressed: {}", btn.name()),
-                    );
+                    ui.colored_label(egui::Color32::YELLOW, format!("Last pressed: {}", btn));
                 }
             });
         });
@@ -192,7 +197,6 @@ impl eframe::App for MacroNovaApp {
             Tab::Editor => {
                 let saved = self.editor_view.show(ui, &self.config);
                 if saved {
-                    // A new macro file may have been created or saved; refresh the dropdown.
                     self.bindings_view.refresh_macro_files();
                 }
             }
@@ -206,7 +210,7 @@ impl eframe::App for MacroNovaApp {
     }
 }
 
-/// Background thread: continuously read button events and send to the UI.
+/// Background thread: read evdev button events and send canonical names to the UI.
 fn evdev_preview_thread(paths: Option<(String, String)>, tx: mpsc::Sender<LiveButtonEvent>) {
     let (mouse_path, kbd_path) = paths.unwrap_or_else(|| {
         warn!("evdev preview: could not discover paths, trying event5/event6");
@@ -230,13 +234,151 @@ fn evdev_preview_thread(paths: Option<(String, String)>, tx: mpsc::Sender<LiveBu
     loop {
         match reader.poll(Duration::from_millis(200)) {
             Ok(Some(ButtonEvent { button, pressed })) => {
-                if tx.send(LiveButtonEvent { button, pressed }).is_err() {
+                if tx
+                    .send(LiveButtonEvent {
+                        button: button.name(),
+                        pressed,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(None) => {}
             Err(e) => {
                 warn!("evdev preview read error: {e}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// Background thread: read HID++ REPROG_CONTROLS_V4 notifications and send
+/// `cid/0xNNNN` button names to the UI.  This runs in parallel with the evdev
+/// thread so the GUI capture feature sees both sources.
+fn hidpp_preview_thread(tx: mpsc::Sender<LiveButtonEvent>) {
+    use macronova_core::device::hidpp::{
+        base::read_notification,
+        constants::{Feature, LOGITECH_VENDOR_ID},
+        decode_button_notification, FeatureTable,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    // Find the HID++ vendor channel.
+    let api = match hidapi::HidApi::new() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("hidpp preview: hidapi init failed: {e}");
+            return;
+        }
+    };
+
+    let (hidraw_path, device_index) = {
+        let mut found = None;
+        for info in api.device_list() {
+            let info: &hidapi::DeviceInfo = info;
+            if info.vendor_id() != LOGITECH_VENDOR_ID {
+                continue;
+            }
+            if info.usage_page() != 0xFF00 {
+                continue;
+            }
+            if let Ok(p) = info.path().to_str() {
+                let name = info.product_string().unwrap_or("").to_lowercase();
+                let idx = if name.contains("receiver") {
+                    0x01u8
+                } else {
+                    0xFF
+                };
+                found = Some((p.to_string(), idx));
+                break;
+            }
+        }
+        match found {
+            Some(v) => v,
+            None => {
+                warn!("hidpp preview: no Logitech HID++ device found");
+                return;
+            }
+        }
+    };
+
+    let device = match api.open_path(
+        std::ffi::CStr::from_bytes_with_nul(format!("{}\0", hidraw_path).as_bytes()).unwrap(),
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("hidpp preview: failed to open {hidraw_path}: {e}");
+            return;
+        }
+    };
+
+    let features = match FeatureTable::query(&device, device_index) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("hidpp preview: feature table query failed: {e}");
+            return;
+        }
+    };
+
+    let reprog_feat_idx = match features.get_index(Feature::ReprogramControlsV4) {
+        Some(i) => i,
+        None => {
+            warn!("hidpp preview: device does not support REPROG_CONTROLS_V4");
+            return;
+        }
+    };
+
+    let mut held: HashMap<u16, bool> = HashMap::new();
+
+    loop {
+        match read_notification(&device, Duration::from_millis(200)) {
+            Ok(None) => {}
+            Ok(Some(notif)) => {
+                if notif.feature_index != reprog_feat_idx || notif.software_id != 0 {
+                    continue;
+                }
+
+                let cids = decode_button_notification(&notif.data);
+                let now_held: HashSet<u16> = cids.iter().copied().filter(|&c| c != 0).collect();
+
+                for &cid in &now_held {
+                    if !held.contains_key(&cid) {
+                        let name = format!("cid/0x{:04x}", cid);
+                        if tx
+                            .send(LiveButtonEvent {
+                                button: name,
+                                pressed: true,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        held.insert(cid, true);
+                    }
+                }
+
+                let released: Vec<u16> = held
+                    .keys()
+                    .copied()
+                    .filter(|c| !now_held.contains(c))
+                    .collect();
+                for cid in released {
+                    let name = format!("cid/0x{:04x}", cid);
+                    if tx
+                        .send(LiveButtonEvent {
+                            button: name,
+                            pressed: false,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    held.remove(&cid);
+                }
+            }
+            Err(e) => {
+                warn!("hidpp preview read error: {e}");
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
