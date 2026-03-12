@@ -1,0 +1,173 @@
+# MacroNova
+
+A universal macro daemon for Linux. Bind physical mouse and keyboard buttons to
+Rhai scripts — run key sequences, type text, click, scroll, and more.
+
+Currently targets **Logitech G502 X Lightspeed** (USB dongle, wireless) on
+**Linux with KDE Plasma Wayland / KWin**.
+
+---
+
+## Features
+
+- Sniff input from a physical device without interfering with normal OS input
+- Bind any button to a `.rhai` script via `on_press` and/or `on_release`
+- Scripts run in a sandboxed Rhai engine with a defined API
+- Hold-aware: `held()` returns false when the button is released, so loops
+  terminate cleanly
+- Hot-reload config: edits to `config.toml` take effect immediately without
+  restarting the daemon
+- GUI for managing bindings, capturing button names, and editing scripts
+- Virtual keyboard injection via uinput (works on Wayland through XWayland's
+  `kbd` handler)
+
+---
+
+## Requirements
+
+- Linux kernel with `uinput` support (`/dev/uinput`)
+- User must be in the `input` group (for reading evdev nodes)
+- KDE Plasma 6 / KWin Wayland (X11 and other compositors untested)
+- Rust 1.75+ (uses the 2021 edition)
+
+---
+
+## Building
+
+```sh
+cargo build --release
+```
+
+The workspace produces three binaries:
+
+| Binary | Crate | Purpose |
+|---|---|---|
+| `macronova-daemon` | `macronova-daemon` | Background daemon (run as user) |
+| `macronova-gui` | `macronova-gui` | Configuration GUI |
+| `hidraw-sniffer` | `macronova-daemon` | Debug: print raw HID++ frames |
+| `evdev-sniffer` | `macronova-daemon` | Debug: print raw evdev events |
+
+---
+
+## Installation
+
+### udev rule (required)
+
+The evdev nodes for the receiver are owned by `root:input`. Add yourself to the
+`input` group and install the udev rule so that future plugs are accessible
+without sudo:
+
+```sh
+sudo cp 42-macronova.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG input $USER   # re-login after this
+```
+
+### Daemon
+
+Run manually:
+
+```sh
+cargo run -p macronova-daemon
+```
+
+Or install as a systemd user service:
+
+```sh
+cp macronova.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now macronova
+```
+
+The service file expects the binary at `~/.cargo/bin/macronova-daemon`:
+
+```sh
+cargo install --path crates/macronova-daemon
+```
+
+---
+
+## Configuration
+
+Config lives at `~/.config/macronova/config.toml`. See
+`config/example.toml` for a fully commented example.
+
+```toml
+[device.G502X]
+wpid = "407F"
+
+[[device.G502X.bindings]]
+button = "event5/key0x0117"   # sniper button
+on_press = "macros/undo.rhai"
+
+[[device.G502X.bindings]]
+button = "event5/key0x0115"   # top side button 1
+on_press  = "macros/click_repeat.rhai"
+on_release = "macros/notify_released.rhai"
+```
+
+Button names use the format `<eventN>/key0x<HHHH>` where `HHHH` is the
+four-digit lowercase EV_KEY hex code. Use the GUI **Capture** button to
+discover the exact name for any physical button.
+
+### Script directory
+
+Scripts are `.rhai` files placed in `~/.config/macronova/macros/`. Paths in
+the config are relative to `~/.config/macronova/`.
+
+---
+
+## Rhai Script API
+
+```rhai
+// Keyboard
+press_key("ctrl")       // hold a key down
+release_key("ctrl")     // release a held key
+tap_key("z")            // press + release
+type_text("hello")      // type a string
+
+// Mouse — STUBBED (see MOUSE.md)
+click("left")           // no-op currently
+press_mouse("right")    // no-op currently
+release_mouse("right")  // no-op currently
+move_mouse(10, -5)      // no-op currently
+warp_mouse(960, 540)    // no-op currently
+scroll(3)               // no-op currently
+hscroll(-1)             // no-op currently
+
+// Control
+sleep(50)               // sleep N milliseconds
+held()                  // true while the trigger button is held
+
+run_command("notify-send MacroNova fired")
+```
+
+`held()` is checked on every Rhai operation. A script with a `while held() {}`
+loop will terminate as soon as the button is released.
+
+---
+
+## Mouse Injection
+
+Mouse injection is currently a no-op stub. See **MOUSE.md** for a detailed
+explanation of what was tried (uinput, XTest), why each approach fails on
+KDE Plasma Wayland, and the correct path forward (XDG RemoteDesktop portal).
+
+---
+
+## Project layout
+
+```
+MacroNova/
+  crates/
+    macronova-core/     # config, evdev discovery, device abstractions
+    macronova-daemon/   # main daemon binary + debug sniffers
+    macronova-gui/      # egui configuration GUI
+  config/
+    example.toml        # annotated example configuration
+  macros/               # example .rhai scripts
+  42-macronova.rules    # udev rule for /dev/input access
+  macronova.service     # systemd user service unit
+  MOUSE.md              # mouse injection research notes
+  ARCHITECTURE.md       # crate and data-flow documentation
+```

@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "crates/macronova-core",
+    "crates/macronova-daemon",
+    "crates/macronova-gui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MacroNova Contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+# Shared
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+anyhow = "1"
+thiserror = "2"
+notify = "7"
+
+# HID
+hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
+libc = "0.2"
+# Input injection
+evdev = "0.13"
+
+# Scripting
+rhai = { version = "1.24", features = ["sync"] }
+
+# GUI
+eframe = "0.31"
+egui = "0.31"
+

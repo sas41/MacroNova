@@ -1,0 +1,23 @@
+# MacroNova udev rules
+# Grants the logged-in console user access to /dev/uinput, Logitech /dev/hidraw*,
+# and Logitech /dev/input/event* devices.
+# Install: sudo cp 42-macronova.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# /dev/uinput — required for synthetic event injection (macronova-daemon)
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
+# Logitech HID devices — required for HID++ communication (daemon + GUI live preview)
+ATTRS{idVendor}=="046d", SUBSYSTEM=="hidraw", TAG+="uaccess"
+
+# Logitech input event devices — required for reading button events via evdev
+# (mouse buttons, keyboard/consumer extra keys)
+ATTRS{idVendor}=="046d", SUBSYSTEM=="input", TAG+="uaccess"
+
+# MacroNova virtual input devices (macronova-kbd, macronova-mouse)
+# libinput requires ID_PATH to be set or it silently ignores the device.
+# Virtual uinput devices have no hardware parent so udev never sets ID_PATH
+# automatically — we set it explicitly here using the device name as a stable
+# synthetic path identifier.
+SUBSYSTEM=="input", ATTRS{name}=="macronova-kbd",   ENV{ID_PATH}="virtual-macronova-kbd",   ENV{ID_PATH_TAG}="virtual-macronova-kbd"
+SUBSYSTEM=="input", ATTRS{name}=="macronova-mouse", ENV{ID_PATH}="virtual-macronova-mouse", ENV{ID_PATH_TAG}="virtual-macronova-mouse"

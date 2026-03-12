@@ -1,0 +1,15 @@
+[package]
+name = "macronova-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+hidapi = { workspace = true }
+libc = { workspace = true }

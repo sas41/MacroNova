@@ -1,0 +1,19 @@
+[package]
+name = "macronova-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "macronova-gui"
+path = "src/main.rs"
+
+[dependencies]
+macronova-core = { path = "../macronova-core" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+notify = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

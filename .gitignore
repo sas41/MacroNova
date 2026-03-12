@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Cargo lock is committed for binaries; remove this line if you want to exclude it
+# Cargo.lock
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test scratch files
+TEST.txt
+
+# Temporary files
+/tmp

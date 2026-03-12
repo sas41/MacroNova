@@ -1,0 +1,13 @@
+[Unit]
+Description=MacroNova macro daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/macronova-daemon
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=macronova_daemon=info
+
+[Install]
+WantedBy=default.target
