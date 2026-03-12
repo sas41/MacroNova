@@ -5,15 +5,13 @@
 ///   release_key(name)      - release a keyboard key
 ///   tap_key(name)          - press and immediately release a keyboard key
 ///   type_text(text)        - type a string
-///   click(btn)             - [STUB] click a mouse button ("left","right","middle","side","extra")
-///   press_mouse(btn)       - [STUB] hold a mouse button down
-///   release_mouse(btn)     - [STUB] release a mouse button
-///   move_mouse(dx, dy)     - [STUB] move cursor relative by (dx, dy) pixels
-///   warp_mouse(x, y)       - [STUB] warp cursor to absolute screen position (x, y)
-///   scroll(amount)         - [STUB] vertical scroll (positive = up)
-///   hscroll(amount)        - [STUB] horizontal scroll (positive = right)
-///
-/// NOTE: All mouse functions are stubs. See MOUSE.md for details.
+///   click(btn)             - click a mouse button ("left","right","middle","side","extra")
+///   press_mouse(btn)       - hold a mouse button down
+///   release_mouse(btn)     - release a mouse button
+///   move_mouse(dx, dy)     - move cursor relative by (dx, dy) pixels
+///   warp_mouse(x, y)       - warp cursor to absolute screen position (x, y)
+///   scroll(amount)         - vertical scroll (positive = down, enigo convention)
+///   hscroll(amount)        - horizontal scroll (positive = right)
 ///   sleep(ms)              - sleep for N milliseconds
 ///   held()                 - returns true while the trigger button is still held
 ///
@@ -26,7 +24,7 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rhai::{Engine, EvalAltResult};
+use rhai::Engine;
 use tracing::{debug, error, warn};
 
 use crate::input::uinput::{key_by_name, UInputDevice};
@@ -48,23 +46,11 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
     let mut engine = Engine::new();
 
     // Sandbox: restrict operations to prevent runaway scripts.
-    engine.set_max_operations(0); // 0 = unlimited, but we use on_progress instead
+    engine.set_max_operations(0); // unlimited — termination is via held() in script loops
     engine.set_max_call_levels(64);
     engine.set_max_string_size(4096);
     engine.set_max_array_size(1024);
     engine.set_max_map_size(256);
-
-    // Check the held flag periodically (every 1000 ops) to allow loop interruption.
-    {
-        let held = Arc::clone(&ctx.held);
-        engine.on_progress(move |_count| {
-            if held.load(Ordering::Relaxed) {
-                None // continue
-            } else {
-                Some("button released".into()) // abort script
-            }
-        });
-    }
 
     // held() → bool: returns true while trigger button is pressed.
     {
@@ -177,7 +163,7 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
         });
     }
 
-    // scroll(amount: int): vertical scroll. Positive = up.
+    // scroll(amount: int): vertical scroll. Positive = down (enigo convention).
     {
         let mouse = Arc::clone(&ctx.mouse);
         engine.register_fn("scroll", move |amount: i64| {
@@ -234,12 +220,7 @@ pub fn run_script(
             debug!("Running macro: {}", script_path);
             match engine.eval::<()>(&source) {
                 Ok(_) => debug!("Macro '{}' completed", script_path),
-                Err(e) => match *e {
-                    EvalAltResult::ErrorTerminated(_, _) => {
-                        debug!("Macro '{}' terminated (button released)", script_path)
-                    }
-                    other => error!("Macro '{}' error: {}", script_path, other),
-                },
+                Err(e) => error!("Macro '{}' error: {}", script_path, e),
             }
         })
         .context("Failed to spawn macro thread")?;

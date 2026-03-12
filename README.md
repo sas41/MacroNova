@@ -20,6 +20,8 @@ Currently targets **Logitech G502 X Lightspeed** (USB dongle, wireless) on
 - GUI for managing bindings, capturing button names, and editing scripts
 - Virtual keyboard injection via uinput (works on Wayland through XWayland's
   `kbd` handler)
+- Mouse injection via the XDG RemoteDesktop portal + EIS (KDE prompts once for
+  permission; subsequent starts reuse the grant automatically)
 
 ---
 
@@ -46,6 +48,7 @@ The workspace produces three binaries:
 | `macronova-gui` | `macronova-gui` | Configuration GUI |
 | `hidraw-sniffer` | `macronova-daemon` | Debug: print raw HID++ frames |
 | `evdev-sniffer` | `macronova-daemon` | Debug: print raw evdev events |
+| `mouse-test` | `macronova-daemon` | Debug: test EIS mouse click injection |
 
 ---
 
@@ -126,14 +129,14 @@ release_key("ctrl")     // release a held key
 tap_key("z")            // press + release
 type_text("hello")      // type a string
 
-// Mouse — STUBBED (see MOUSE.md)
-click("left")           // no-op currently
-press_mouse("right")    // no-op currently
-release_mouse("right")  // no-op currently
-move_mouse(10, -5)      // no-op currently
-warp_mouse(960, 540)    // no-op currently
-scroll(3)               // no-op currently
-hscroll(-1)             // no-op currently
+// Mouse (via XDG RemoteDesktop portal + EIS — KDE will prompt once for permission)
+click("left")           // click a mouse button
+press_mouse("right")    // hold a mouse button down
+release_mouse("right")  // release a mouse button
+move_mouse(10, -5)      // relative cursor movement
+warp_mouse(960, 540)    // absolute cursor warp
+scroll(3)               // vertical scroll (positive = down)
+hscroll(-1)             // horizontal scroll (positive = right)
 
 // Control
 sleep(50)               // sleep N milliseconds
@@ -142,16 +145,18 @@ held()                  // true while the trigger button is held
 run_command("notify-send MacroNova fired")
 ```
 
-`held()` is checked on every Rhai operation. A script with a `while held() {}`
-loop will terminate as soon as the button is released.
+`held()` is checked at `while` loop boundaries. Loops terminate cleanly after
+the current cycle completes — press/release pairs are never split mid-cycle.
+See **SCRIPTING.md** for the full API reference and key name list.
 
 ---
 
 ## Mouse Injection
 
-Mouse injection is currently a no-op stub. See **MOUSE.md** for a detailed
-explanation of what was tried (uinput, XTest), why each approach fails on
-KDE Plasma Wayland, and the correct path forward (XDG RemoteDesktop portal).
+Mouse injection uses the **XDG RemoteDesktop portal** (`ConnectToEIS`) backed
+by `xdg-desktop-portal-kde`. On first run KDE shows a one-time permission
+dialog; the grant is persisted so subsequent daemon starts need no interaction.
+See **ARCHITECTURE.md** for implementation details and research history.
 
 ---
 
@@ -168,6 +173,6 @@ MacroNova/
   macros/               # example .rhai scripts
   42-macronova.rules    # udev rule for /dev/input access
   macronova.service     # systemd user service unit
-  MOUSE.md              # mouse injection research notes
   ARCHITECTURE.md       # crate and data-flow documentation
+  SCRIPTING.md          # Rhai API reference and key name list
 ```

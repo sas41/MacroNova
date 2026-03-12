@@ -20,3 +20,6 @@ TEST.txt
 
 # Temporary files
 /tmp
+
+# Built distribution artifacts
+/artifacts

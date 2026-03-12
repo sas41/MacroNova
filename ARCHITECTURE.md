@@ -15,14 +15,15 @@ macronova-daemon    (binary: macronova-daemon)
   ├─ main.rs            Entry point, event loop, config hot-reload
   ├─ input/
   │    ├─ uinput.rs     Virtual keyboard via uinput (BUS_USB trick for XWayland)
-  │    └─ xtest.rs      Mouse injector stub (see MOUSE.md)
+  │    └─ xtest.rs      Mouse injector via XDG RemoteDesktop portal + EIS
   └─ engine/
        └─ rhai.rs       Sandboxed Rhai engine, ScriptContext, run_script()
 
-macronova-daemon    (binaries: hidraw-sniffer, evdev-sniffer)
+macronova-daemon    (binaries: hidraw-sniffer, evdev-sniffer, mouse-test)
   └─ bin/
        ├─ hidraw_sniffer.rs   Print raw HID++ frames from /dev/hidraw*
-       └─ evdev_sniffer.rs    Print raw evdev events from /dev/input/event*
+       ├─ evdev_sniffer.rs    Print raw evdev events from /dev/input/event*
+       └─ mouse_test.rs       Standalone EIS click test / diagnostic tool
 
 macronova-gui       (binary: macronova-gui)
   ├─ app.rs             MacroNovaApp — top-level egui app, owns Config
@@ -94,13 +95,49 @@ The `BUS_USB` bus type in the uinput descriptor causes the kernel to assign the
 directly (not through libinput), so key events reach both X11 and Wayland-native
 windows.
 
-### Mouse injection (STUBBED)
+### Mouse injection (daemon)
 
-Mouse injection is not implemented. All Rhai mouse functions are no-ops.
-See **MOUSE.md** for what was tried and the correct path forward.
+```
+Rhai script calls click / press_mouse / move_mouse / scroll …
+        │
+        │  MouseCmd sent via mpsc::SyncSender (non-blocking)
+        ▼
+  macronova-eis thread  (std::thread, owns EIS socket)
+        │
+        │  libc::poll on EIS fd — wakes on socket readable OR every 50 ms
+        │  drain_eis(): reads EIS events, handles seat/device enumeration,
+        │               calls start_emulating on every Virtual device
+        │  execute(): sends button/motion/scroll frames to the right device
+        ▼
+  KDE EIS server → pointer/button event delivered to focused window
+```
 
-The correct approach is the XDG RemoteDesktop portal (`NotifyPointerButton`,
-`ConnectToEIS`) implemented via `ashpd` + `reis`.
+**Portal session setup** (once at daemon start, blocking):
+
+1. A temporary tokio current-thread runtime runs the async portal flow:
+   `RemoteDesktop::new()` → `create_session()` →
+   `select_devices(Keyboard | Pointer, persist=Application)` →
+   `start()` → `connect_to_eis()` → `ei::Context`
+2. `reis::handshake::ei_handshake_blocking()` completes the EIS wire handshake.
+3. The worker thread is spawned with the `ei::Context`.
+4. `MouseInjector::new()` blocks on a `Condvar` until the worker signals that
+   at least one Virtual device has reached `Resumed` state (i.e. is ready to
+   accept input). Falls back after a 3-second timeout.
+
+`persist=Application` causes KDE to store the grant; subsequent daemon starts
+reuse it without showing the permission dialog again.
+
+**Device selection**: KDE provides three virtual devices — `eis pointer`
+(`ei_pointer + ei_button + ei_scroll`), `eis absolute device`
+(`ei_pointer_absolute + ei_button + ei_scroll`), and `eis keyboard`
+(`ei_keyboard`). Button clicks and relative motion use the `eis pointer`
+device; absolute warps use `eis absolute device`. Each command is sent to
+exactly one device to avoid duplicate events.
+
+**Graceful degradation**: if the portal is unavailable (no
+`DBUS_SESSION_BUS_ADDRESS`, user denied, etc.) `MouseInjector::new()` logs a
+warning and returns an injector with `tx = None`; all mouse calls become
+silent no-ops so the daemon continues running for keyboard macros.
 
 ### Script execution
 
@@ -113,16 +150,15 @@ run_script(path, held: Arc<AtomicBool>, uinput, mouse)
         ▼
   Rhai Engine::eval()
         │
-        │  on_progress hook: check held.load() on every op
-        │  → returns Some("button released") to abort if held=false
-        │
         └─ registered functions call into uinput / mouse via Arc<Mutex<>>
+           held() checks the AtomicBool directly
 ```
 
 Each script runs in its own thread. The `held` `AtomicBool` is shared between
 the event loop thread (which sets it `false` on button release) and the script
-thread (which checks it via `held()` and via the `on_progress` hook). The hook
-fires on every Rhai operation, so loops abort promptly after release.
+thread (which checks it via `held()`). Scripts are not interrupted mid-execution
+— termination happens only at `while held()` loop boundaries, ensuring
+press/release pairs are always completed.
 
 ### Config hot-reload
 
@@ -144,7 +180,8 @@ bindings, so a newly loaded config takes effect on the next button press.
 | Thread | Role |
 |---|---|
 | Main thread | evdev poll loop + config watcher drain |
-| `macro:<path>` threads | One per active script; terminate when script ends or `held=false` |
+| `macronova-eis` | Owns EIS socket; drains EIS events and executes mouse commands |
+| `macro:<path>` threads | One per active script; terminate when script ends or `held()` returns false |
 
 `UInputDevice` and `MouseInjector` are wrapped in `Arc<Mutex<>>` and shared
 across macro threads. All Rhai engine state is per-thread (the engine is
@@ -190,6 +227,17 @@ land under that path regardless of the bus type set in the descriptor.
 virtually all application windows are native Wayland clients. XTest events never
 leave XWayland; no Wayland surface receives them.
 
+### Why enigo 0.6 libei clicks were silently dropped
+
+`enigo 0.6`'s `Enigo::new()` calls `start_emulating` only on devices already
+`Resumed` at the moment `new()` returns. KDE's EIS server sends the
+pointer/button virtual device asynchronously — it arrives after `new()` has
+returned. With no further event loop running, `self.devices` never contained a
+device with an `ei_button` interface, so the `if let Some(...)` guard silently
+fell through on every click. The keyboard worked by coincidence (its device
+arrived in time during the synchronous init). This is why enigo was replaced
+with a direct `ashpd` + `reis` implementation.
+
 ### Why the virtual keyboard works
 
 XWayland opens and reads `kbd`-handler evdev nodes directly, bypassing libinput.
@@ -197,3 +245,12 @@ Setting `BUS_USB` in the uinput descriptor causes the kernel to assign the `kbd`
 handler to the virtual device. Key events sent to it are delivered to whichever
 window XWayland has focused, including native Wayland windows via XWayland's
 Wayland surface.
+
+### Why the EIS worker uses a Condvar at startup
+
+After the portal handshake completes, KDE sends seat and device descriptors
+asynchronously. If a macro fires immediately after daemon start (before the
+worker has processed the first `Resumed` event), `self.devices` is empty and
+clicks are dropped. The `Condvar` in `MouseInjector::try_new()` blocks the
+calling thread until the worker signals that at least one device is emulating,
+guaranteeing the injector is usable before `new()` returns.
