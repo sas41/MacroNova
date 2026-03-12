@@ -17,10 +17,6 @@ path = "src/bin/hidraw_sniffer.rs"
 name = "evdev-sniffer"
 path = "src/bin/evdev_sniffer.rs"
 
-[[bin]]
-name = "mouse-test"
-path = "src/bin/mouse_test.rs"
-
 [dependencies]
 macronova-core = { path = "../macronova-core" }
 hidapi = { workspace = true }
@@ -31,6 +27,3 @@ rhai = { workspace = true }
 notify = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
-ashpd = { version = "0.13", default-features = false, features = ["remote_desktop", "screencast", "tokio"] }
-reis = "0.6"
-tokio = { version = "1", features = ["rt", "macros"] }

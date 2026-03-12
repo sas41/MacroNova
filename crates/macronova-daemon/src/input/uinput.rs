@@ -1,51 +1,60 @@
-/// Virtual uinput keyboard for injecting synthetic key events.
+/// Virtual uinput device for injecting keyboard, mouse button, and mouse motion events.
 ///
-/// Uses BUS_USB so the kernel assigns it the `kbd` handler, which XWayland reads
-/// directly — bypassing libinput (which ignores all /devices/virtual/input/ devices).
-/// Mouse injection is handled separately via XTest (see xtest.rs).
+/// Uses BUS_USB so the kernel assigns it handlers that libinput and compositors
+/// will actually route — BUS_VIRTUAL is silently ignored on Wayland.
+///
+/// Replaces the former EIS/RemoteDesktop portal path entirely.  `warp_mouse`
+/// (absolute positioning) is not supported and is a no-op.
 use anyhow::{Context, Result};
 use evdev::{
     uinput::VirtualDevice, AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode,
-    SynchronizationCode,
+    RelativeAxisCode, SynchronizationCode,
 };
 use tracing::info;
 
-/// A virtual input device that can inject key and mouse events.
+const EV_REL: u16 = 0x02;
+
+/// A virtual input device that can inject key, mouse-button, and relative-motion events.
 pub struct UInputDevice {
     device: VirtualDevice,
 }
 
 impl UInputDevice {
-    /// Create the virtual keyboard device.
+    /// Create the virtual input device.
     ///
-    /// Uses `BUS_USB` so that libinput's compositor instance (KWin, Mutter, etc.)
-    /// actually picks up and routes events from this device.  `BUS_VIRTUAL`
-    /// is silently ignored by libinput, making key injection invisible on Wayland.
-    ///
-    /// Only `KEY_*` codes 1–255 are registered (standard keyboard keys).
-    /// `BTN_*` codes (0x110+) and `EV_REL` axes are absent so libinput classifies
-    /// this purely as a keyboard and never as a pointer.
+    /// Registers:
+    /// - `KEY_*` codes 1–255 (keyboard keys)
+    /// - `BTN_*` codes 0x110–0x11f (mouse buttons: left, right, middle, side, extra…)
+    /// - `EV_REL` axes: X, Y, WHEEL, HWHEEL (relative mouse motion and scroll)
     pub fn new() -> Result<Self> {
         let mut keys = AttributeSet::<KeyCode>::new();
         for code in 1..=255u16 {
             keys.insert(KeyCode(code));
         }
+        for code in 0x110..=0x11fu16 {
+            keys.insert(KeyCode(code));
+        }
 
-        // BUS_USB (0x03) is required: libinput ignores BUS_VIRTUAL (0x06) devices,
-        // so they never reach KWin/Mutter and key injection silently does nothing
-        // on Wayland.  Vendor 0x0000 / product 0x0001 are clearly synthetic.
+        let mut axes = AttributeSet::<RelativeAxisCode>::new();
+        axes.insert(RelativeAxisCode::REL_X);
+        axes.insert(RelativeAxisCode::REL_Y);
+        axes.insert(RelativeAxisCode::REL_WHEEL);
+        axes.insert(RelativeAxisCode::REL_HWHEEL);
+
         let id = InputId::new(BusType::BUS_USB, 0x0000, 0x0001, 0x0001);
 
         let device = VirtualDevice::builder()
             .context("Failed to create VirtualDeviceBuilder")?
-            .name("macronova-kbd")
+            .name("macronova-input")
             .input_id(id)
             .with_keys(&keys)
             .context("Failed to set keys")?
+            .with_relative_axes(&axes)
+            .context("Failed to set relative axes")?
             .build()
             .context("Failed to build virtual device")?;
 
-        info!("Created virtual input device 'macronova-kbd' (BUS_USB)");
+        info!("Created virtual input device 'macronova-input' (BUS_USB)");
         Ok(Self { device })
     }
 
@@ -94,6 +103,91 @@ impl UInputDevice {
         Ok(())
     }
 
+    /// Press a mouse button (BTN_LEFT etc.) down.
+    pub fn button_down(&mut self, code: u16) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EventType::KEY.0, code, 1),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Release a mouse button.
+    pub fn button_up(&mut self, code: u16) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EventType::KEY.0, code, 0),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Click a mouse button (down + up).
+    pub fn button_click(&mut self, code: u16) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EventType::KEY.0, code, 1),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+            InputEvent::new(EventType::KEY.0, code, 0),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Move the mouse cursor relatively by (dx, dy) pixels.
+    pub fn move_rel(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EV_REL, RelativeAxisCode::REL_X.0, dx),
+            InputEvent::new(EV_REL, RelativeAxisCode::REL_Y.0, dy),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Vertical scroll. Positive = down (one unit = one detent).
+    pub fn scroll(&mut self, clicks: i32) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EV_REL, RelativeAxisCode::REL_WHEEL.0, -clicks),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Horizontal scroll. Positive = right.
+    pub fn hscroll(&mut self, clicks: i32) -> Result<()> {
+        self.device.emit(&[
+            InputEvent::new(EV_REL, RelativeAxisCode::REL_HWHEEL.0, clicks),
+            InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_REPORT.0,
+                0,
+            ),
+        ])?;
+        Ok(())
+    }
+
     /// Type a string by tapping individual key codes.
     /// Only supports basic ASCII; non-ASCII characters are silently skipped.
     pub fn type_text(&mut self, text: &str) -> Result<()> {
@@ -109,6 +203,21 @@ impl UInputDevice {
             }
         }
         Ok(())
+    }
+}
+
+/// Resolve a human-friendly mouse button name → evdev BTN code.
+///
+/// Accepts: "left", "right", "middle", "side"/"back", "extra"/"forward",
+/// or numeric evdev codes like "0x110".
+pub fn btn_by_name(name: &str) -> Option<u16> {
+    match name.to_uppercase().as_str() {
+        "LEFT" | "BTN_LEFT" | "1" => Some(0x110),
+        "RIGHT" | "BTN_RIGHT" | "3" => Some(0x111),
+        "MIDDLE" | "BTN_MIDDLE" | "2" => Some(0x112),
+        "SIDE" | "BTN_SIDE" | "BACK" | "8" => Some(0x113),
+        "EXTRA" | "BTN_EXTRA" | "FORWARD" | "9" => Some(0x114),
+        _ => None,
     }
 }
 

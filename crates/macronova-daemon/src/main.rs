@@ -19,7 +19,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::input::hidpp_reader::{cid_from_button_name, spawn as spawn_hidpp, HidppButtonEvent};
 use crate::input::uinput::UInputDevice;
-use crate::input::xtest::MouseInjector;
 
 /// Try to discover and open an evdev reader.  Returns `None` if the device is
 /// not present yet (caller should retry later).
@@ -29,7 +28,7 @@ fn try_open_reader() -> Option<EvdevReader> {
         Some(EvdevPaths {
             mouse_path: "/dev/input/event5".into(),
             kbd_path: "/dev/input/event6".into(),
-            mouse_label: String::new(), // will fall back to eventN basename
+            mouse_label: String::new(),
             kbd_label: String::new(),
         })
     })?;
@@ -71,9 +70,8 @@ fn main() -> Result<()> {
     info!("MacroNova daemon starting");
 
     let uinput = Arc::new(Mutex::new(
-        UInputDevice::new().context("Failed to create uinput virtual keyboard")?,
+        UInputDevice::new().context("Failed to create uinput virtual input device")?,
     ));
-    let mouse = Arc::new(Mutex::new(MouseInjector::new()));
 
     let config_dir = default_config_dir();
     let config_path = config_dir.join("config.toml");
@@ -99,7 +97,6 @@ fn main() -> Result<()> {
     };
 
     // Spawn the HID++ reader thread if there are any CID-based bindings.
-    // `hidpp_alive` is cleared by the thread on exit so we can re-spawn after reconnect.
     let (hidpp_tx, hidpp_rx) = std::sync::mpsc::channel::<HidppButtonEvent>();
     let hidpp_alive = Arc::new(AtomicBool::new(false));
     if !cids_to_divert.is_empty() {
@@ -109,9 +106,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Initial device open — wait indefinitely with backoff until the device
-    // appears (handles the case where the daemon starts before the dongle is
-    // plugged in).
+    // Initial device open — wait with backoff until the device appears.
     let mut reconnect_delay = Duration::from_millis(500);
     let mut reader: Option<EvdevReader> = None;
     while reader.is_none() {
@@ -125,7 +120,7 @@ fn main() -> Result<()> {
         }
     }
     let mut reader = reader.unwrap();
-    reconnect_delay = Duration::from_millis(500); // reset for future reconnects
+    reconnect_delay = Duration::from_millis(500);
 
     let mut active_held: HashMap<String, Arc<AtomicBool>> = HashMap::new();
 
@@ -149,57 +144,31 @@ fn main() -> Result<()> {
         // Drain HID++ notification events (non-blocking).
         while let Ok(ev) = hidpp_rx.try_recv() {
             if ev.name.is_empty() {
-                continue; // keepalive sentinel
+                continue;
             }
             if ev.pressed {
-                handle_button_down(
-                    &ev.name,
-                    &config,
-                    Arc::clone(&uinput),
-                    Arc::clone(&mouse),
-                    &mut active_held,
-                );
+                handle_button_down(&ev.name, &config, Arc::clone(&uinput), &mut active_held);
             } else {
-                handle_button_up(
-                    &ev.name,
-                    &config,
-                    Arc::clone(&uinput),
-                    Arc::clone(&mouse),
-                    &mut active_held,
-                );
+                handle_button_up(&ev.name, &config, Arc::clone(&uinput), &mut active_held);
             }
         }
 
         // Poll evdev (blocks up to 100ms).
         match reader.poll(Duration::from_millis(100)) {
             Ok(None) => {
-                reconnect_delay = Duration::from_millis(500); // device is alive; reset backoff
+                reconnect_delay = Duration::from_millis(500);
                 continue;
             }
             Ok(Some(ev)) => {
-                reconnect_delay = Duration::from_millis(500); // device is alive; reset backoff
+                reconnect_delay = Duration::from_millis(500);
                 let name = ev.button.name();
                 if ev.pressed {
-                    handle_button_down(
-                        &name,
-                        &config,
-                        Arc::clone(&uinput),
-                        Arc::clone(&mouse),
-                        &mut active_held,
-                    );
+                    handle_button_down(&name, &config, Arc::clone(&uinput), &mut active_held);
                 } else {
-                    handle_button_up(
-                        &name,
-                        &config,
-                        Arc::clone(&uinput),
-                        Arc::clone(&mouse),
-                        &mut active_held,
-                    );
+                    handle_button_up(&name, &config, Arc::clone(&uinput), &mut active_held);
                 }
             }
             Err(e) => {
-                // The device was unplugged or an unrecoverable I/O error occurred.
-                // Drop the dead reader and attempt to reopen with exponential backoff.
                 error!("evdev read error (device lost?): {e} — attempting reconnect");
                 drop(reader);
 
@@ -213,10 +182,7 @@ fn main() -> Result<()> {
                             reader = new_reader;
                             reconnect_delay = Duration::from_millis(500);
 
-                            // Re-spawn the HID++ reader if it exited due to device loss.
-                            if !cids_to_divert.is_empty()
-                                && !hidpp_alive.load(Ordering::Relaxed)
-                            {
+                            if !cids_to_divert.is_empty() && !hidpp_alive.load(Ordering::Relaxed) {
                                 info!("Re-spawning HID++ reader after reconnect");
                                 if let Err(e) = spawn_hidpp(
                                     cids_to_divert.clone(),
@@ -246,7 +212,6 @@ fn handle_button_down(
     button_name: &str,
     config: &Arc<Mutex<Config>>,
     uinput: Arc<Mutex<UInputDevice>>,
-    mouse: Arc<Mutex<MouseInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
     let script_path: Option<String> = {
@@ -261,7 +226,6 @@ fn handle_button_down(
     let script_path = match script_path {
         Some(p) => p,
         None => {
-            // Suppress noise for the three main mouse buttons.
             let suppress = matches!(button_name,
                 n if n.ends_with("/key0x0110")   // BTN_LEFT
                   || n.ends_with("/key0x0111")   // BTN_RIGHT
@@ -286,7 +250,6 @@ fn handle_button_down(
         resolved.to_str().unwrap_or(&script_path),
         held,
         uinput,
-        mouse,
     ) {
         error!("Failed to launch macro for {:?}: {}", button_name, e);
     }
@@ -296,15 +259,12 @@ fn handle_button_up(
     button_name: &str,
     config: &Arc<Mutex<Config>>,
     uinput: Arc<Mutex<UInputDevice>>,
-    mouse: Arc<Mutex<MouseInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
-    // Signal any running on_press script to stop.
     if let Some(held) = active_held.remove(button_name) {
         held.store(false, Ordering::Relaxed);
     }
 
-    // Look up the on_release script path.
     let release_path: Option<String> = {
         let cfg = config.lock().unwrap();
         cfg.device
@@ -330,12 +290,8 @@ fn handle_button_up(
             resolved.to_str().unwrap_or(&script_path),
             held,
             uinput,
-            mouse,
         ) {
-            error!(
-                "Failed to launch on_release macro for {:?}: {}",
-                button_name, e
-            );
+            error!("Failed to launch on_release macro for {:?}: {}", button_name, e);
         }
     } else if !suppress {
         info!("Button {:?} UP", button_name);

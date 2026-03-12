@@ -9,12 +9,13 @@
 ///   press_mouse(btn)       - hold a mouse button down
 ///   release_mouse(btn)     - release a mouse button
 ///   move_mouse(dx, dy)     - move cursor relative by (dx, dy) pixels
-///   warp_mouse(x, y)       - warp cursor to absolute screen position (x, y)
-///   scroll(amount)         - vertical scroll (positive = down, enigo convention)
+///   warp_mouse(x, y)       - no-op (absolute positioning not supported via uinput)
+///   scroll(amount)         - vertical scroll (positive = down)
 ///   hscroll(amount)        - horizontal scroll (positive = right)
 ///   sleep(ms)              - sleep for N milliseconds
 ///   held()                 - returns true while the trigger button is still held
 ///
+/// All input injection goes through the uinput virtual device.
 /// Scripts run in a dedicated thread. The held() function checks a shared
 /// AtomicBool that the daemon sets to false on button release.
 use std::sync::{
@@ -27,18 +28,15 @@ use anyhow::{Context, Result};
 use rhai::Engine;
 use tracing::{debug, error, warn};
 
-use crate::input::uinput::{key_by_name, UInputDevice};
-use crate::input::xtest::{xbtn_by_name, MouseInjector};
+use crate::input::uinput::{btn_by_name, key_by_name, UInputDevice};
 
 /// Shared state passed into Rhai registered functions.
 #[derive(Clone)]
 pub struct ScriptContext {
     /// Set to false when the trigger button is released.
     pub held: Arc<AtomicBool>,
-    /// Virtual keyboard for injecting key events.
+    /// Virtual input device for injecting key and mouse events.
     pub uinput: Arc<Mutex<UInputDevice>>,
-    /// Mouse injector stub (see MOUSE.md — not yet implemented).
-    pub mouse: Arc<Mutex<MouseInjector>>,
 }
 
 /// Build a sandboxed Rhai Engine with the MacroNova API registered.
@@ -68,10 +66,8 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
         let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("press_key", move |name: &str| match key_by_name(name) {
             Some(key) => {
-                if let Ok(mut dev) = uinput.lock() {
-                    if let Err(e) = dev.key_down(key) {
-                        warn!("press_key({}) failed: {}", name, e);
-                    }
+                if let Err(e) = uinput.lock().unwrap().key_down(key) {
+                    warn!("press_key({}) failed: {}", name, e);
                 }
             }
             None => warn!("press_key: unknown key '{}'", name),
@@ -83,10 +79,8 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
         let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("release_key", move |name: &str| match key_by_name(name) {
             Some(key) => {
-                if let Ok(mut dev) = uinput.lock() {
-                    if let Err(e) = dev.key_up(key) {
-                        warn!("release_key({}) failed: {}", name, e);
-                    }
+                if let Err(e) = uinput.lock().unwrap().key_up(key) {
+                    warn!("release_key({}) failed: {}", name, e);
                 }
             }
             None => warn!("release_key: unknown key '{}'", name),
@@ -98,10 +92,8 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
         let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("tap_key", move |name: &str| match key_by_name(name) {
             Some(key) => {
-                if let Ok(mut dev) = uinput.lock() {
-                    if let Err(e) = dev.tap_key(key) {
-                        warn!("tap_key({}) failed: {}", name, e);
-                    }
+                if let Err(e) = uinput.lock().unwrap().tap_key(key) {
+                    warn!("tap_key({}) failed: {}", name, e);
                 }
             }
             None => warn!("tap_key: unknown key '{}'", name),
@@ -112,70 +104,83 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
     {
         let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("type_text", move |text: &str| {
-            if let Ok(mut dev) = uinput.lock() {
-                if let Err(e) = dev.type_text(text) {
-                    warn!("type_text failed: {}", e);
-                }
+            if let Err(e) = uinput.lock().unwrap().type_text(text) {
+                warn!("type_text failed: {}", e);
             }
         });
     }
 
     // click(btn: &str): click a mouse button once.
     {
-        let mouse = Arc::clone(&ctx.mouse);
-        engine.register_fn("click", move |btn: &str| match xbtn_by_name(btn) {
-            Some(b) => mouse.lock().unwrap().click(b),
+        let uinput = Arc::clone(&ctx.uinput);
+        engine.register_fn("click", move |btn: &str| match btn_by_name(btn) {
+            Some(code) => {
+                if let Err(e) = uinput.lock().unwrap().button_click(code) {
+                    warn!("click({}) failed: {}", btn, e);
+                }
+            }
             None => warn!("click: unknown button '{}'", btn),
         });
     }
 
     // press_mouse(btn: &str): hold a mouse button down.
     {
-        let mouse = Arc::clone(&ctx.mouse);
-        engine.register_fn("press_mouse", move |btn: &str| match xbtn_by_name(btn) {
-            Some(b) => mouse.lock().unwrap().button_event(b, true),
+        let uinput = Arc::clone(&ctx.uinput);
+        engine.register_fn("press_mouse", move |btn: &str| match btn_by_name(btn) {
+            Some(code) => {
+                if let Err(e) = uinput.lock().unwrap().button_down(code) {
+                    warn!("press_mouse({}) failed: {}", btn, e);
+                }
+            }
             None => warn!("press_mouse: unknown button '{}'", btn),
         });
     }
 
     // release_mouse(btn: &str): release a mouse button.
     {
-        let mouse = Arc::clone(&ctx.mouse);
-        engine.register_fn("release_mouse", move |btn: &str| match xbtn_by_name(btn) {
-            Some(b) => mouse.lock().unwrap().button_event(b, false),
+        let uinput = Arc::clone(&ctx.uinput);
+        engine.register_fn("release_mouse", move |btn: &str| match btn_by_name(btn) {
+            Some(code) => {
+                if let Err(e) = uinput.lock().unwrap().button_up(code) {
+                    warn!("release_mouse({}) failed: {}", btn, e);
+                }
+            }
             None => warn!("release_mouse: unknown button '{}'", btn),
         });
     }
 
     // move_mouse(dx: int, dy: int): move cursor relatively.
     {
-        let mouse = Arc::clone(&ctx.mouse);
+        let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("move_mouse", move |dx: i64, dy: i64| {
-            mouse.lock().unwrap().move_rel(dx as i32, dy as i32);
+            if let Err(e) = uinput.lock().unwrap().move_rel(dx as i32, dy as i32) {
+                warn!("move_mouse failed: {}", e);
+            }
         });
     }
 
-    // warp_mouse(x: int, y: int): warp cursor to absolute position.
-    {
-        let mouse = Arc::clone(&ctx.mouse);
-        engine.register_fn("warp_mouse", move |x: i64, y: i64| {
-            mouse.lock().unwrap().move_abs(x as i32, y as i32);
-        });
-    }
+    // warp_mouse(x: int, y: int): absolute positioning — not supported via uinput.
+    engine.register_fn("warp_mouse", |_x: i64, _y: i64| {
+        warn!("warp_mouse is not supported (requires display server integration)");
+    });
 
-    // scroll(amount: int): vertical scroll. Positive = down (enigo convention).
+    // scroll(amount: int): vertical scroll. Positive = down.
     {
-        let mouse = Arc::clone(&ctx.mouse);
+        let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("scroll", move |amount: i64| {
-            mouse.lock().unwrap().scroll(amount as i32);
+            if let Err(e) = uinput.lock().unwrap().scroll(amount as i32) {
+                warn!("scroll failed: {}", e);
+            }
         });
     }
 
     // hscroll(amount: int): horizontal scroll. Positive = right.
     {
-        let mouse = Arc::clone(&ctx.mouse);
+        let uinput = Arc::clone(&ctx.uinput);
         engine.register_fn("hscroll", move |amount: i64| {
-            mouse.lock().unwrap().hscroll(amount as i32);
+            if let Err(e) = uinput.lock().unwrap().hscroll(amount as i32) {
+                warn!("hscroll failed: {}", e);
+            }
         });
     }
 
@@ -194,23 +199,18 @@ pub fn build_engine(ctx: ScriptContext) -> Engine {
     engine
 }
 
-/// Run a Rhai script file in a blocking thread.
+/// Run a Rhai script file in a dedicated thread.
 /// The `held` AtomicBool controls loop continuation.
 /// The script thread is detached; it terminates when `held` → false or the script ends.
 pub fn run_script(
     script_path: &str,
     held: Arc<AtomicBool>,
     uinput: Arc<Mutex<UInputDevice>>,
-    mouse: Arc<Mutex<MouseInjector>>,
 ) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
         .with_context(|| format!("Failed to read macro script: {}", script_path))?;
 
-    let ctx = ScriptContext {
-        held: Arc::clone(&held),
-        uinput,
-        mouse,
-    };
+    let ctx = ScriptContext { held, uinput };
 
     let script_path = script_path.to_string();
     std::thread::Builder::new()
