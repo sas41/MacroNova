@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use macronova_core::{
     config::{default_config_dir, Config},
-    device::evdev_input::{discover_evdev_paths, EvdevPaths, EvdevReader},
+    device::evdev_input::{discover_evdev_paths, DeviceEvent, EvdevPaths, EvdevReader, RawEvent},
 };
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -60,6 +60,12 @@ fn try_open_reader() -> Option<EvdevReader> {
             None
         }
     }
+}
+
+/// Returns `true` if Virtual Mode is enabled.
+/// When Virtual Mode is off the daemon never grabs the device.
+fn config_needs_grab(config: &Config) -> bool {
+    config.virtual_mode
 }
 
 fn main() -> Result<()> {
@@ -140,6 +146,20 @@ fn main() -> Result<()> {
     let mut reader = reader.unwrap();
     reconnect_delay = Duration::from_millis(500);
 
+    // Apply initial grab state based on config.
+    let mut grabbed = false;
+    {
+        let cfg = config.lock().unwrap();
+        if config_needs_grab(&cfg) {
+            if let Err(e) = reader.grab(true) {
+                warn!("EVIOCGRAB failed: {e} — interception will not work");
+            } else {
+                grabbed = true;
+                info!("evdev grab acquired (intercept bindings present)");
+            }
+        }
+    }
+
     let mut active_held: HashMap<String, Arc<AtomicBool>> = HashMap::new();
 
     info!("Entering main event loop");
@@ -151,7 +171,22 @@ fn main() -> Result<()> {
                     match Config::load(&config_path) {
                         Ok(new_cfg) => {
                             info!("Config reloaded");
+                            let new_grab = config_needs_grab(&new_cfg);
                             *config.lock().unwrap() = new_cfg;
+                            // Update grab state if it changed.
+                            if new_grab != grabbed {
+                                match reader.grab(new_grab) {
+                                    Ok(()) => {
+                                        grabbed = new_grab;
+                                        if grabbed {
+                                            info!("evdev grab acquired");
+                                        } else {
+                                            info!("evdev grab released");
+                                        }
+                                    }
+                                    Err(e) => warn!("EVIOCGRAB({new_grab}) failed: {e}"),
+                                }
+                            }
                         }
                         Err(e) => warn!("Failed to reload config: {}", e),
                     }
@@ -160,12 +195,20 @@ fn main() -> Result<()> {
         }
 
         // Drain HID++ notification events (non-blocking).
+        // HID++ buttons are diverted at the firmware level so no passthrough
+        // is needed for them — they never reach the OS event stack anyway.
         while let Ok(ev) = hidpp_rx.try_recv() {
             if ev.name.is_empty() {
                 continue;
             }
             if ev.pressed {
-                handle_button_down(&ev.name, &config, Arc::clone(&injector), &mut active_held);
+                handle_button_down(
+                    &ev.name,
+                    None,
+                    &config,
+                    Arc::clone(&injector),
+                    &mut active_held,
+                );
             } else {
                 handle_button_up(&ev.name, &config, Arc::clone(&injector), &mut active_held);
             }
@@ -177,13 +220,41 @@ fn main() -> Result<()> {
                 reconnect_delay = Duration::from_millis(500);
                 continue;
             }
-            Ok(Some(ev)) => {
+            Ok(Some(DeviceEvent::Passthrough(pt))) => {
+                reconnect_delay = Duration::from_millis(500);
+                // Only forward when the device is actually grabbed.  When not
+                // grabbed the kernel still delivers events to the compositor
+                // directly — re-injecting here would double every motion event.
+                if grabbed {
+                    if let Err(e) = injector.lock().unwrap().passthrough_raw(
+                        pt.raw.ev_type,
+                        pt.raw.code,
+                        pt.raw.value,
+                    ) {
+                        warn!("passthrough_raw failed: {e}");
+                    }
+                }
+            }
+            Ok(Some(DeviceEvent::Button(ev))) => {
                 reconnect_delay = Duration::from_millis(500);
                 let name = ev.button.name();
+                let raw = ev.raw;
                 if ev.pressed {
-                    handle_button_down(&name, &config, Arc::clone(&injector), &mut active_held);
+                    handle_button_down(
+                        &name,
+                        if grabbed { Some(raw) } else { None },
+                        &config,
+                        Arc::clone(&injector),
+                        &mut active_held,
+                    );
                 } else {
-                    handle_button_up(&name, &config, Arc::clone(&injector), &mut active_held);
+                    handle_button_up_raw(
+                        &name,
+                        if grabbed { Some(raw) } else { None },
+                        &config,
+                        Arc::clone(&injector),
+                        &mut active_held,
+                    );
                 }
             }
             Err(e) => {
@@ -199,6 +270,14 @@ fn main() -> Result<()> {
                             info!("evdev device reconnected — resuming");
                             reader = new_reader;
                             reconnect_delay = Duration::from_millis(500);
+
+                            // Re-apply grab after reconnect.
+                            if grabbed {
+                                if let Err(e) = reader.grab(true) {
+                                    warn!("EVIOCGRAB failed after reconnect: {e}");
+                                    grabbed = false;
+                                }
+                            }
 
                             if !cids_to_divert.is_empty() && !hidpp_alive.load(Ordering::Relaxed) {
                                 info!("Re-spawning HID++ reader after reconnect");
@@ -226,20 +305,51 @@ fn main() -> Result<()> {
     }
 }
 
+/// Look up the binding for a button name.
+/// Returns `(on_press_path, intercept)`.
+fn lookup_binding_down(button_name: &str, config: &Arc<Mutex<Config>>) -> (Option<String>, bool) {
+    let cfg = config.lock().unwrap();
+    cfg.device
+        .values()
+        .flat_map(|dc| dc.bindings.iter())
+        .find(|b| b.button.as_deref() == Some(button_name))
+        .map(|b| (b.on_press.clone(), b.intercept))
+        .unwrap_or((None, false))
+}
+
+/// Look up the on_release script and intercept flag for a button.
+fn lookup_binding_up(button_name: &str, config: &Arc<Mutex<Config>>) -> (Option<String>, bool) {
+    let cfg = config.lock().unwrap();
+    cfg.device
+        .values()
+        .flat_map(|dc| dc.bindings.iter())
+        .find(|b| b.button.as_deref() == Some(button_name))
+        .map(|b| (b.on_release.clone(), b.intercept))
+        .unwrap_or((None, false))
+}
+
 fn handle_button_down(
     button_name: &str,
+    // Raw event for passthrough, present only when the device is grabbed.
+    raw: Option<RawEvent>,
     config: &Arc<Mutex<Config>>,
     injector: Arc<Mutex<dyn InputInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
-    let script_path: Option<String> = {
-        let cfg = config.lock().unwrap();
-        cfg.device
-            .values()
-            .flat_map(|dc| dc.bindings.iter())
-            .find(|b| b.button.as_deref() == Some(button_name))
-            .and_then(|b| b.on_press.clone())
-    };
+    let (script_path, intercept) = lookup_binding_down(button_name, config);
+
+    // If grabbed and not intercepted, forward the event to the OS.
+    if raw.is_some() && !intercept {
+        if let Some(r) = raw {
+            if let Err(e) = injector
+                .lock()
+                .unwrap()
+                .passthrough_raw(r.ev_type, r.code, r.value)
+            {
+                warn!("passthrough_raw failed: {e}");
+            }
+        }
+    }
 
     let script_path = match script_path {
         Some(p) => p,
@@ -277,18 +387,34 @@ fn handle_button_up(
     injector: Arc<Mutex<dyn InputInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
+    handle_button_up_raw(button_name, None, config, injector, active_held);
+}
+
+fn handle_button_up_raw(
+    button_name: &str,
+    raw: Option<RawEvent>,
+    config: &Arc<Mutex<Config>>,
+    injector: Arc<Mutex<dyn InputInjector>>,
+    active_held: &mut HashMap<String, Arc<AtomicBool>>,
+) {
     if let Some(held) = active_held.remove(button_name) {
         held.store(false, Ordering::Relaxed);
     }
 
-    let release_path: Option<String> = {
-        let cfg = config.lock().unwrap();
-        cfg.device
-            .values()
-            .flat_map(|dc| dc.bindings.iter())
-            .find(|b| b.button.as_deref() == Some(button_name))
-            .and_then(|b| b.on_release.clone())
-    };
+    let (release_path, intercept) = lookup_binding_up(button_name, config);
+
+    // If grabbed and not intercepted, forward the release event to the OS.
+    if raw.is_some() && !intercept {
+        if let Some(r) = raw {
+            if let Err(e) = injector
+                .lock()
+                .unwrap()
+                .passthrough_raw(r.ev_type, r.code, r.value)
+            {
+                warn!("passthrough_raw failed: {e}");
+            }
+        }
+    }
 
     let suppress = matches!(button_name,
         n if n.ends_with("/key0x0110")   // BTN_LEFT

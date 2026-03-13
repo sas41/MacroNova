@@ -6,7 +6,7 @@ use egui::{CentralPanel, Context, TopBottomPanel};
 use macronova_core::{
     config::{default_config_path, Config},
     device::{
-        evdev_input::{discover_evdev_paths, ButtonEvent, EvdevPaths, EvdevReader},
+        evdev_input::{discover_evdev_paths, DeviceEvent, EvdevPaths, EvdevReader},
         logitech::discover_devices,
         DeviceInfo,
     },
@@ -275,12 +275,16 @@ fn evdev_preview_thread(tx: mpsc::Sender<LiveButtonEvent>) {
 
     loop {
         match reader.poll(Duration::from_millis(200)) {
-            Ok(Some(ButtonEvent { button, pressed })) => {
+            Ok(Some(DeviceEvent::Passthrough(_))) => {
+                // Motion/scroll — not relevant for the capture preview.
+                reconnect_delay = Duration::from_millis(500);
+            }
+            Ok(Some(DeviceEvent::Button(btn_ev))) => {
                 reconnect_delay = Duration::from_millis(500);
                 if tx
                     .send(LiveButtonEvent {
-                        button: button.name(),
-                        pressed,
+                        button: btn_ev.button.name(),
+                        pressed: btn_ev.pressed,
                     })
                     .is_err()
                 {

@@ -67,6 +67,38 @@ impl SettingsView {
             .weak(),
         );
 
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Virtual Mode").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "When enabled, MacroNova grabs the input device exclusively and can \
+                intercept individual button presses — consuming them so they never \
+                reach the OS. All other events (motion, scroll, non-intercepted \
+                buttons) are transparently re-injected so the device works normally.\n\n\
+                When disabled (default), the daemon never grabs the device and the \
+                Intercept option on bindings has no effect.",
+            );
+            ui.add_space(6.0);
+
+            let prev = updated.virtual_mode;
+            ui.checkbox(&mut updated.virtual_mode, "Enable Virtual Mode");
+            if updated.virtual_mode != prev {
+                changed = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "Note: toggling Virtual Mode takes effect immediately on the next \
+                config reload (the daemon hot-reloads config.toml automatically).",
+            )
+            .italics()
+            .weak(),
+        );
+
         if changed {
             Some(updated)
         } else {

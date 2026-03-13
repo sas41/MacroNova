@@ -85,6 +85,21 @@ pub trait InputInjector: Send {
     fn scroll(&mut self, clicks: i32) -> Result<()>;
     /// Horizontal scroll. Positive = right.
     fn hscroll(&mut self, clicks: i32) -> Result<()>;
+
+    // ── Passthrough ───────────────────────────────────────────────────────────
+
+    /// Forward a raw evdev event that was read while the device was grabbed.
+    ///
+    /// Used to re-inject events for buttons that are not intercepted, so that
+    /// the rest of the OS still receives them normally.
+    ///
+    /// `ev_type`, `code`, and `value` are the raw `input_event` fields.
+    /// The default implementation is a no-op (used on platforms where grab is
+    /// not implemented).
+    fn passthrough_raw(&mut self, ev_type: u16, code: u16, value: i32) -> Result<()> {
+        let _ = (ev_type, code, value);
+        Ok(())
+    }
 }
 
 // ── Cursor position ───────────────────────────────────────────────────────────

@@ -33,6 +33,18 @@ pub struct Config {
     /// Defaults to `jitter` (most compatible).
     #[serde(default)]
     pub warp_mode: WarpMode,
+
+    /// When `true`, Virtual Mode is active: the daemon can grab the input
+    /// device exclusively and intercept individual button presses so they
+    /// are consumed rather than forwarded to the OS.  All non-intercepted
+    /// events (motion, scroll, and buttons without `intercept = true`) are
+    /// transparently re-injected via uinput so the device still works normally.
+    ///
+    /// When `false` (default), the daemon never grabs the device and the
+    /// `intercept` field on bindings has no effect — behaviour is identical
+    /// to a version of MacroNova without this feature.
+    #[serde(default)]
+    pub virtual_mode: bool,
 }
 
 /// Configuration for a single device.
@@ -73,6 +85,13 @@ pub struct ButtonBinding {
 
     /// Path to the Rhai script to run when the button is released.
     pub on_release: Option<String>,
+
+    /// When `true` the button event is consumed by the daemon and never
+    /// forwarded to the compositor / OS.  Only the bound macro runs.
+    /// When `false` (default) the button behaves normally in addition to
+    /// triggering the macro.
+    #[serde(default)]
+    pub intercept: bool,
 }
 
 impl Config {

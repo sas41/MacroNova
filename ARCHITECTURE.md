@@ -57,6 +57,7 @@ macronova-gui       (binary: macronova-gui)
 | Absolute cursor warp | uinput `EV_ABS` | _stub_ | _stub_ |
 | Desktop size query | Wayland `wl_output` / X11 `XDisplayWidth` | _stub_ | _stub_ |
 | Cursor position query | Not supported on Wayland; `XQueryPointer` on X11 | _stub_ | _stub_ |
+| Virtual Mode (exclusive grab + passthrough) | `EVIOCGRAB` + uinput re-injection | _not planned_ | _not planned_ |
 
 ---
 
@@ -89,6 +90,10 @@ The evdev fd is opened with plain `O_RDONLY` — **no `EVIOCGRAB`**. The kernel
 delivers a copy of every event to each open fd independently, so the daemon reads
 events without consuming them from the OS input stack.
 
+When **Virtual Mode** is enabled the fd is re-opened (or the existing fd is
+upgraded) with `EVIOCGRAB`, exclusively claiming the device. See the Virtual
+Mode section below.
+
 Two evdev nodes are opened for the Logitech USB receiver:
 
 | By-id symlink suffix | Contents |
@@ -98,6 +103,50 @@ Two evdev nodes are opened for the Logitech USB receiver:
 
 Both are discovered automatically via `/dev/input/by-id/` at startup with
 automatic reconnect on unplug/replug.
+
+### Virtual Mode / input interception (Linux)
+
+Virtual Mode uses `EVIOCGRAB` to claim exclusive ownership of the evdev device.
+Once grabbed, the compositor receives **no** raw events from that device — every
+event the daemon does not explicitly re-inject is silently consumed.
+
+```
+Physical device (grabbed via EVIOCGRAB)
+        │
+        │  libc::read → input_event { type, code, value }
+        ▼
+  EvdevReader::poll()
+        │
+        ├─ EV_KEY event
+        │       │
+        │       ▼
+        │   DeviceEvent::Button { button, pressed }
+        │       │
+        │       ├─ binding found AND intercept = true
+        │       │       └─ run macro script; event is NOT re-injected
+        │       │
+        │       └─ no binding OR intercept = false
+        │               └─ DeviceEvent::Passthrough forwarded by main.rs
+        │                       └─ UInputInjector::passthrough_raw(EV_KEY, code, value)
+        │                               └─ writes to "macronova-kbd" uinput device
+        │
+        └─ non-EV_KEY event (EV_REL motion/scroll, EV_SYN, …)
+                └─ DeviceEvent::Passthrough forwarded unconditionally
+                        └─ UInputInjector::passthrough_raw(type, code, value)
+                                ├─ EV_KEY  → "macronova-kbd"
+                                └─ EV_REL  → "macronova-mouse"
+```
+
+Key invariant: `Passthrough` events are forwarded **only when `grabbed = true`**.
+When the device is not grabbed the compositor still receives events directly;
+forwarding them would double every motion event and double mouse sensitivity.
+
+`EVIOCGRAB` is all-or-nothing per fd — it grabs the entire device, not
+individual buttons. The per-binding `intercept` flag is enforced in software:
+non-intercepted `EV_KEY` events are re-injected via the uinput passthrough path.
+
+The grab is acquired/released on every config hot-reload (to match the current
+`virtual_mode` value) and re-acquired automatically after a device reconnect.
 
 ### Keyboard injection
 
@@ -233,7 +282,8 @@ invocation (no shared engine state between scripts).
 
 ```toml
 # Global settings
-warp_mode = "jitter"   # "jitter" (default) | "direct"
+warp_mode    = "jitter"   # "jitter" (default) | "direct"
+virtual_mode = false      # true → EVIOCGRAB + uinput passthrough
 
 [device.<name>]
 wpid    = "407F"       # Logitech wireless product ID (optional, informational)
@@ -243,6 +293,8 @@ usb_pid = "C099"       # USB product ID (optional, informational)
 button     = "usb-Logitech_USB_Receiver-event-mouse/key0x0115"
 on_press   = "macros/foo.rhai"    # relative to ~/.config/macronova/
 on_release = "macros/bar.rhai"    # optional
+intercept  = false                # true → suppress passthrough for this button
+                                  # (only meaningful when virtual_mode = true)
 ```
 
 Button names use a stable by-id label format:
@@ -290,6 +342,25 @@ libinput as an ambiguous "keyboard+pointer" profile. On some compositors this
 causes relative motion events to be ignored or misrouted. Splitting into a
 dedicated keyboard device (`macronova-kbd`) and a dedicated mouse device
 (`macronova-mouse`) ensures each is classified and routed correctly.
+
+### Why Virtual Mode must re-inject all non-intercepted events
+
+`EVIOCGRAB` is all-or-nothing: once the fd is grabbed the kernel stops delivering
+events to every other consumer of that device — including the compositor. If the
+daemon did not re-inject motion and scroll events via uinput, the mouse would
+become completely unresponsive while Virtual Mode is active. Every `EV_REL` and
+`EV_SYN` event read from the grabbed fd is therefore forwarded unconditionally
+through `passthrough_raw` → `macronova-mouse`. Non-intercepted `EV_KEY` events
+are forwarded through `macronova-kbd`.
+
+### Why passthrough is only active when grabbed
+
+When `virtual_mode = false` the evdev fd is not grabbed. The compositor still
+receives events directly from the kernel. If the daemon also called
+`passthrough_raw` in that state, every motion and key event would be delivered
+twice — once from the real device and once from the uinput passthrough — doubling
+mouse sensitivity and causing duplicate keypresses. The `grabbed` flag gates all
+passthrough emission.
 
 ### Why KDE Plasma shows the correct window icon
 

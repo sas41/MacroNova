@@ -14,6 +14,11 @@
 //! sync-stream state machine, no implicit exclusive ownership.  The
 //! compositor's fd (managed by logind / libinput) is completely unaffected.
 //!
+//! When `grab()` is called, `EVIOCGRAB` is issued and the daemon becomes the
+//! sole reader. In that mode `poll()` surfaces ALL event types (not just
+//! `EV_KEY`) so the caller can forward non-intercepted events back to the OS
+//! via uinput passthrough.
+//!
 //! ## ButtonId encoding
 //! Every button is identified by the **evdev node path** and **key code** it came from:
 //!
@@ -33,6 +38,7 @@ use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use tracing::warn;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Raw kernel input_event layout (matches <linux/input.h>)
@@ -56,6 +62,19 @@ struct RawInputEvent {
 const EV_KEY: u16 = 0x01;
 const EV_SYN: u16 = 0x00;
 const INPUT_EVENT_SIZE: usize = std::mem::size_of::<RawInputEvent>();
+
+// EVIOCGRAB ioctl: acquire/release exclusive access to a device.
+// _IOW('E', 0x90, int)  →  0x40044590
+#[cfg(target_os = "linux")]
+const EVIOCGRAB: libc::c_ulong = 0x40044590;
+
+/// A raw evdev event, preserved for passthrough forwarding.
+#[derive(Debug, Clone, Copy)]
+pub struct RawEvent {
+    pub ev_type: u16,
+    pub code: u16,
+    pub value: i32,
+}
 
 /// A button identified by its evdev node and key code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -89,6 +108,30 @@ impl ButtonId {
 pub struct ButtonEvent {
     pub button: ButtonId,
     pub pressed: bool,
+    /// The raw evdev event, preserved so the daemon can forward it via uinput
+    /// when the device is grabbed and the button is not intercepted.
+    pub raw: RawEvent,
+}
+
+/// An event that is not a button press/release and should be forwarded
+/// transparently when the device is grabbed.
+///
+/// Includes mouse motion (`EV_REL`), absolute axes (`EV_ABS`), misc events
+/// (`EV_MSC`), etc. — anything the grabbed device produces that isn't an
+/// `EV_KEY` press or release.
+#[derive(Debug, Clone, Copy)]
+pub struct PassthroughEvent {
+    pub raw: RawEvent,
+}
+
+/// An event returned by [`EvdevReader::poll`].
+#[derive(Debug, Clone)]
+pub enum DeviceEvent {
+    /// A key/button press or release.
+    Button(ButtonEvent),
+    /// A non-button event (motion, scroll, misc) that should be forwarded
+    /// to the OS when the device is grabbed.
+    Passthrough(PassthroughEvent),
 }
 
 /// Per-device state: a raw O_RDONLY | O_NONBLOCK file descriptor.
@@ -106,10 +149,11 @@ impl Drop for DeviceHandle {
 /// Reads button events from one or more evdev nodes without grabbing them.
 ///
 /// Opens each path with `O_RDONLY | O_NONBLOCK` via a raw libc syscall.
-/// No `EVIOCGRAB` is issued — the compositor's input pipeline is untouched.
+/// No `EVIOCGRAB` is issued by default — the compositor's input pipeline is
+/// untouched.  Call [`EvdevReader::grab`] to acquire exclusive access.
 pub struct EvdevReader {
     handles: Vec<DeviceHandle>,
-    pending: Vec<ButtonEvent>,
+    pending: Vec<DeviceEvent>,
 }
 
 impl EvdevReader {
@@ -160,10 +204,51 @@ impl EvdevReader {
         })
     }
 
-    /// Poll all devices for the next button event, blocking up to `timeout`.
+    /// Acquire or release exclusive access to all opened evdev devices.
     ///
-    /// Returns `Ok(Some(event))`, `Ok(None)` on timeout, or `Err` on I/O failure.
-    pub fn poll(&mut self, timeout: Duration) -> Result<Option<ButtonEvent>> {
+    /// When grabbed (`grab = true`), the kernel stops delivering events from
+    /// these fds to all other readers (compositor, libinput, etc.). The daemon
+    /// becomes the sole consumer and must forward any events it does not
+    /// intercept back to the OS via uinput passthrough.
+    ///
+    /// No-op on non-Linux targets.
+    pub fn grab(&self, grab: bool) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let arg: libc::c_int = if grab { 1 } else { 0 };
+            for handle in &self.handles {
+                let ret = unsafe { libc::ioctl(handle.fd, EVIOCGRAB, arg) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EBUSY) {
+                        warn!(
+                            "evdev: EVIOCGRAB on {} failed: device is busy \
+                             (another process has exclusive access)",
+                            handle.node
+                        );
+                    } else {
+                        return Err(err).with_context(|| {
+                            format!("EVIOCGRAB({grab}) failed on {}", handle.node)
+                        });
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = grab;
+        Ok(())
+    }
+
+    /// Poll all devices for the next event, blocking up to `timeout`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(DeviceEvent::Button(_)))` — a key/button press or release
+    /// - `Ok(Some(DeviceEvent::Passthrough(_)))` — motion, scroll, or any
+    ///   other non-key event (only produced when the device is grabbed; the
+    ///   caller should forward these via `InputInjector::passthrough_raw`)
+    /// - `Ok(None)` — timeout elapsed with no events
+    /// - `Err(_)` — I/O failure (device lost, etc.)
+    pub fn poll(&mut self, timeout: Duration) -> Result<Option<DeviceEvent>> {
         if let Some(ev) = self.pending.pop() {
             return Ok(Some(ev));
         }
@@ -199,23 +284,43 @@ impl EvdevReader {
                         break; // partial read — shouldn't happen, skip
                     }
 
-                    // Skip SYN events and anything that isn't EV_KEY
-                    if ev.ev_type == EV_SYN || ev.ev_type != EV_KEY {
+                    // Always skip SYN events — they're framing separators,
+                    // not meaningful input.
+                    if ev.ev_type == EV_SYN {
                         continue;
                     }
 
-                    // Skip autorepeat (value == 2)
-                    if ev.value == 2 {
-                        continue;
+                    if ev.ev_type == EV_KEY {
+                        // Skip autorepeat (value == 2) — macros fire once on
+                        // press; autorepeat is handled by the script (held()).
+                        if ev.value == 2 {
+                            continue;
+                        }
+                        self.pending.push(DeviceEvent::Button(ButtonEvent {
+                            button: ButtonId {
+                                node: handle.node.clone(),
+                                code: ev.code,
+                            },
+                            pressed: ev.value == 1,
+                            raw: RawEvent {
+                                ev_type: ev.ev_type,
+                                code: ev.code,
+                                value: ev.value,
+                            },
+                        }));
+                    } else {
+                        // EV_REL (motion, scroll), EV_ABS, EV_MSC, etc.
+                        // Surface these as Passthrough so the daemon can
+                        // forward them when the device is grabbed.
+                        self.pending
+                            .push(DeviceEvent::Passthrough(PassthroughEvent {
+                                raw: RawEvent {
+                                    ev_type: ev.ev_type,
+                                    code: ev.code,
+                                    value: ev.value,
+                                },
+                            }));
                     }
-
-                    self.pending.push(ButtonEvent {
-                        button: ButtonId {
-                            node: handle.node.clone(),
-                            code: ev.code,
-                        },
-                        pressed: ev.value == 1,
-                    });
                     got_any = true;
                 }
             }
@@ -269,8 +374,6 @@ pub fn discover_evdev_paths() -> Option<EvdevPaths> {
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // Match the Logitech USB Receiver symlinks.
-        // The mouse interface has no "-if" infix; the kbd interface has "-if01".
         if name.contains("Logitech") && name.contains("USB_Receiver") {
             if name.ends_with("-event-mouse") && !name.contains("-if") {
                 let target = std::fs::read_link(entry.path()).ok()?;

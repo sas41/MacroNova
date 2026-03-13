@@ -339,6 +339,38 @@ impl InputInjector for UInputInjector {
         ])?;
         Ok(())
     }
+
+    fn passthrough_raw(&mut self, ev_type: u16, code: u16, value: i32) -> Result<()> {
+        // Route to the correct virtual device based on event type and code.
+        // EV_KEY with code < 0x100: keyboard key → kbd device
+        // EV_KEY with code >= 0x100: BTN_* mouse button → mouse device
+        // EV_REL: relative axis (motion/scroll) → mouse device
+        // Everything else is ignored (EV_ABS from a physical mouse is not
+        // forwarded; the compositor handles absolute positioning itself).
+        const EV_KEY_TYPE: u16 = 0x01;
+        const EV_REL_TYPE: u16 = 0x02;
+        let syn = InputEvent::new(
+            EventType::SYNCHRONIZATION.0,
+            SynchronizationCode::SYN_REPORT.0,
+            0,
+        );
+        match ev_type {
+            EV_KEY_TYPE if code < 0x100 => {
+                self.kbd
+                    .emit(&[InputEvent::new(ev_type, code, value), syn])?;
+            }
+            EV_KEY_TYPE => {
+                self.mouse
+                    .emit(&[InputEvent::new(ev_type, code, value), syn])?;
+            }
+            EV_REL_TYPE => {
+                self.mouse
+                    .emit(&[InputEvent::new(ev_type, code, value), syn])?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 // ── Key/button name resolution ────────────────────────────────────────────────

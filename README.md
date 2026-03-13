@@ -27,6 +27,9 @@ the codebase; contributions welcome.
 - Absolute cursor warp via `uinput` `EV_ABS` (works on Wayland)
 - Configurable warp mode: **Jitter** (default, most compatible) or **Direct**
   (`INPUT_PROP_DIRECT`)
+- **Virtual Mode**: grab the physical device exclusively so the OS never sees
+  the raw events; per-binding `intercept` flag suppresses forwarding of
+  individual buttons while all other input is passed through transparently
 
 ---
 
@@ -99,20 +102,28 @@ systemctl --user enable --now macronova-daemon
 Config lives at `~/.config/macronova/config.toml`.
 
 ```toml
+# Wayland cursor warp mode: "jitter" (default) or "direct"
+warp_mode = "jitter"
+
+# Virtual Mode: grab the physical device exclusively (EVIOCGRAB).
+# The OS never receives raw events; the daemon re-injects everything it does
+# not intercept.  Per-binding intercept = true suppresses that button's
+# passthrough so the compositor never sees it.
+virtual_mode = false
+
 [device.G502X]
 wpid = "407F"
 
 [[device.G502X.bindings]]
-button   = "usb-Logitech_USB_Receiver-event-mouse/key0x0117"
-on_press = "macros/undo.rhai"
+button    = "usb-Logitech_USB_Receiver-event-mouse/key0x0117"
+on_press  = "macros/undo.rhai"
+intercept = true   # suppress this button — OS never sees it
 
 [[device.G502X.bindings]]
 button     = "usb-Logitech_USB_Receiver-event-mouse/key0x0115"
 on_press   = "macros/spam_lmb.rhai"
 on_release = "macros/spam_lmb.rhai"
-
-# Wayland cursor warp mode: "jitter" (default) or "direct"
-warp_mode = "jitter"
+# intercept = false (default) — button still reaches the compositor
 ```
 
 Use the GUI **Capture** button to discover the exact button name for any

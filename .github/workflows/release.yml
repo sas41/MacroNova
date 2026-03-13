@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  # ── Generate version tag (shared by all jobs) ─────────────────────────
+  version:
+    name: Generate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release_name: ${{ steps.tag.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate tag
+        id: tag
+        run: |
+          TAG="v$(date -u +'%Y-%m-%d-%H%M')-$(git rev-parse --short HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=MacroNova $TAG" >> "$GITHUB_OUTPUT"
+
+  # ── Build jobs ────────────────────────────────────────────────────────
+
+  build-linux:
+    name: Build (linux-x64)
+    runs-on: ubuntu-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x64-cargo-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libxdo-dev
+
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --bin macronova-daemon \
+            --bin macronova-gui
+
+      - name: Assemble distribution tree
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          PKG="MacroNova-$TAG-linux-x64/MacroNova"
+
+          mkdir -p "$PKG/MacroNova-Daemon/macros"
+          mkdir -p "$PKG/MacroNova-GUI/icons"
+
+          # Daemon
+          cp target/release/macronova-daemon          "$PKG/MacroNova-Daemon/macronova-daemon"
+          cp publish/linux/42-macronova.rules          "$PKG/MacroNova-Daemon/42-macronova.rules"
+          cp publish/linux/macronova.service           "$PKG/MacroNova-Daemon/macronova.service"
+          cp publish/config/macros/*.rhai              "$PKG/MacroNova-Daemon/macros/"
+
+          # GUI
+          cp target/release/macronova-gui              "$PKG/MacroNova-GUI/macronova-gui"
+          cp publish/linux/macronova-gui.desktop       "$PKG/MacroNova-GUI/macronova-gui.desktop"
+          cp assets/logo-256.png                       "$PKG/MacroNova-GUI/icons/macronova-256.png"
+          cp assets/logo.svg                           "$PKG/MacroNova-GUI/icons/macronova.svg"
+
+          # Install script
+          cp publish/linux/install-macronova.sh        "MacroNova-$TAG-linux-x64/install-macronova.sh"
+          chmod +x "MacroNova-$TAG-linux-x64/install-macronova.sh"
+          chmod +x "$PKG/MacroNova-Daemon/macronova-daemon"
+          chmod +x "$PKG/MacroNova-GUI/macronova-gui"
+
+      - name: Create zip
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          zip -r "MacroNova-$TAG-linux-x64.zip" "MacroNova-$TAG-linux-x64/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacroNova-linux-x64
+          path: MacroNova-${{ needs.version.outputs.tag }}-linux-x64.zip
+          retention-days: 1
+
+  # ── Release job ───────────────────────────────────────────────────────
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.release_name }}
+          generate_release_notes: true
+          files: |
+            dist/MacroNova-linux-x64/MacroNova-${{ needs.version.outputs.tag }}-linux-x64.zip

@@ -211,6 +211,33 @@ impl BindingsView {
                                         "no scripts — create one in the Editor tab",
                                     );
                                 }
+
+                                // Intercept checkbox — visible always, but only
+                                // interactive when Virtual Mode is enabled.
+                                ui.add_space(8.0);
+                                ui.add_enabled_ui(new_config.virtual_mode, |ui| {
+                                    let mut intercept = if new_config.virtual_mode {
+                                        device_cfg.bindings[idx].intercept
+                                    } else {
+                                        false
+                                    };
+                                    let cb = ui.checkbox(&mut intercept, "Intercept");
+                                    cb.on_hover_text(if new_config.virtual_mode {
+                                        "When enabled, the button press is consumed by \
+                                         MacroNova and not forwarded to the OS. Only the \
+                                         macro runs.\n\
+                                         When disabled, the macro runs and the button \
+                                         also behaves normally."
+                                    } else {
+                                        "Requires Virtual Mode to be enabled (Settings tab)."
+                                    });
+                                    if new_config.virtual_mode
+                                        && intercept != device_cfg.bindings[idx].intercept
+                                    {
+                                        device_cfg.bindings[idx].intercept = intercept;
+                                        changed = true;
+                                    }
+                                });
                             });
                         });
                         ui.add_space(2.0);
@@ -231,6 +258,7 @@ impl BindingsView {
                             cid: 0,
                             on_press: None,
                             on_release: None,
+                            intercept: false,
                         });
                         changed = true;
                     }
