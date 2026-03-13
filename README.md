@@ -1,5 +1,5 @@
-<p align="center">>
-<img src="assets/logo-256.png" alt="MacroNova" width="96"/>
+<p align="center">
+  <img src="assets/logo-256.png" alt="MacroNova" width="96"/>
 </p
 
 # MacroNova
