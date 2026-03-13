@@ -17,8 +17,10 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use macronova_core::platform::input::{get_desktop_size, InputInjector};
+
 use crate::input::hidpp_reader::{cid_from_button_name, spawn as spawn_hidpp, HidppButtonEvent};
-use crate::input::uinput::UInputDevice;
+use crate::input::PlatformInjector;
 
 /// Try to discover and open an evdev reader.  Returns `None` if the device is
 /// not present yet (caller should retry later).
@@ -69,13 +71,19 @@ fn main() -> Result<()> {
 
     info!("MacroNova daemon starting");
 
-    let uinput = Arc::new(Mutex::new(
-        UInputDevice::new().context("Failed to create uinput virtual input device")?,
-    ));
-
     let config_dir = default_config_dir();
     let config_path = config_dir.join("config.toml");
     let config = Arc::new(Mutex::new(Config::load_default()?));
+
+    let (desktop_w, desktop_h) = get_desktop_size().unwrap_or_else(|| {
+        warn!("Could not determine desktop size; defaulting to 1920x1080 for warp scaling");
+        (1920, 1080)
+    });
+    let warp_mode = config.lock().unwrap().warp_mode;
+    let injector: Arc<Mutex<dyn InputInjector>> = Arc::new(Mutex::new(
+        PlatformInjector::new(desktop_w, desktop_h, warp_mode)
+            .context("Failed to create platform input injector")?,
+    ));
     info!("Loaded config from {}", config_path.display());
 
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
@@ -100,8 +108,15 @@ fn main() -> Result<()> {
     let (hidpp_tx, hidpp_rx) = std::sync::mpsc::channel::<HidppButtonEvent>();
     let hidpp_alive = Arc::new(AtomicBool::new(false));
     if !cids_to_divert.is_empty() {
-        info!("Spawning HID++ reader for {} CID binding(s)", cids_to_divert.len());
-        if let Err(e) = spawn_hidpp(cids_to_divert.clone(), hidpp_tx.clone(), Arc::clone(&hidpp_alive)) {
+        info!(
+            "Spawning HID++ reader for {} CID binding(s)",
+            cids_to_divert.len()
+        );
+        if let Err(e) = spawn_hidpp(
+            cids_to_divert.clone(),
+            hidpp_tx.clone(),
+            Arc::clone(&hidpp_alive),
+        ) {
             warn!("HID++ reader unavailable: {e} — falling back to evdev only");
         }
     }
@@ -113,7 +128,10 @@ fn main() -> Result<()> {
         match try_open_reader() {
             Some(r) => reader = Some(r),
             None => {
-                info!("Waiting for evdev device — retrying in {}ms", reconnect_delay.as_millis());
+                info!(
+                    "Waiting for evdev device — retrying in {}ms",
+                    reconnect_delay.as_millis()
+                );
                 std::thread::sleep(reconnect_delay);
                 reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(5));
             }
@@ -147,9 +165,9 @@ fn main() -> Result<()> {
                 continue;
             }
             if ev.pressed {
-                handle_button_down(&ev.name, &config, Arc::clone(&uinput), &mut active_held);
+                handle_button_down(&ev.name, &config, Arc::clone(&injector), &mut active_held);
             } else {
-                handle_button_up(&ev.name, &config, Arc::clone(&uinput), &mut active_held);
+                handle_button_up(&ev.name, &config, Arc::clone(&injector), &mut active_held);
             }
         }
 
@@ -163,9 +181,9 @@ fn main() -> Result<()> {
                 reconnect_delay = Duration::from_millis(500);
                 let name = ev.button.name();
                 if ev.pressed {
-                    handle_button_down(&name, &config, Arc::clone(&uinput), &mut active_held);
+                    handle_button_down(&name, &config, Arc::clone(&injector), &mut active_held);
                 } else {
-                    handle_button_up(&name, &config, Arc::clone(&uinput), &mut active_held);
+                    handle_button_up(&name, &config, Arc::clone(&injector), &mut active_held);
                 }
             }
             Err(e) => {
@@ -211,7 +229,7 @@ fn main() -> Result<()> {
 fn handle_button_down(
     button_name: &str,
     config: &Arc<Mutex<Config>>,
-    uinput: Arc<Mutex<UInputDevice>>,
+    injector: Arc<Mutex<dyn InputInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
     let script_path: Option<String> = {
@@ -246,11 +264,9 @@ fn handle_button_down(
     active_held.insert(button_name.to_string(), Arc::clone(&held));
     info!("Button {:?} DOWN → running {:?}", button_name, resolved);
 
-    if let Err(e) = engine::rhai::run_script(
-        resolved.to_str().unwrap_or(&script_path),
-        held,
-        uinput,
-    ) {
+    if let Err(e) =
+        engine::rhai::run_script(resolved.to_str().unwrap_or(&script_path), held, injector)
+    {
         error!("Failed to launch macro for {:?}: {}", button_name, e);
     }
 }
@@ -258,7 +274,7 @@ fn handle_button_down(
 fn handle_button_up(
     button_name: &str,
     config: &Arc<Mutex<Config>>,
-    uinput: Arc<Mutex<UInputDevice>>,
+    injector: Arc<Mutex<dyn InputInjector>>,
     active_held: &mut HashMap<String, Arc<AtomicBool>>,
 ) {
     if let Some(held) = active_held.remove(button_name) {
@@ -286,12 +302,13 @@ fn handle_button_up(
         };
         info!("Button {:?} UP → running {:?}", button_name, resolved);
         let held = Arc::new(AtomicBool::new(true));
-        if let Err(e) = engine::rhai::run_script(
-            resolved.to_str().unwrap_or(&script_path),
-            held,
-            uinput,
-        ) {
-            error!("Failed to launch on_release macro for {:?}: {}", button_name, e);
+        if let Err(e) =
+            engine::rhai::run_script(resolved.to_str().unwrap_or(&script_path), held, injector)
+        {
+            error!(
+                "Failed to launch on_release macro for {:?}: {}",
+                button_name, e
+            );
         }
     } else if !suppress {
         info!("Button {:?} UP", button_name);

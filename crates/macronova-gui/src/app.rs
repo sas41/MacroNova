@@ -16,6 +16,7 @@ use tracing::warn;
 
 use crate::views::{
     bindings::BindingsView, daemon::DaemonView, devices::DevicesView, editor::EditorView,
+    settings::SettingsView,
 };
 
 /// Which tab is currently active.
@@ -25,6 +26,7 @@ pub enum Tab {
     Bindings,
     Editor,
     Daemon,
+    Settings,
 }
 
 /// Live button state fed from background threads to the UI.
@@ -48,6 +50,7 @@ pub struct MacroNovaApp {
     pub bindings_view: BindingsView,
     pub editor_view: EditorView,
     pub daemon_view: DaemonView,
+    pub settings_view: SettingsView,
 
     pub last_device_scan: Instant,
     pub status_message: Option<String>,
@@ -90,6 +93,7 @@ impl MacroNovaApp {
         let editor_view = EditorView::new();
         let devices_view = DevicesView::new(devices.clone());
         let daemon_view = DaemonView::new();
+        let settings_view = SettingsView::new();
 
         Self {
             tab: Tab::Bindings,
@@ -102,6 +106,7 @@ impl MacroNovaApp {
             bindings_view,
             editor_view,
             daemon_view,
+            settings_view,
             last_device_scan: Instant::now(),
             status_message: None,
             _watcher: watcher,
@@ -168,6 +173,7 @@ impl eframe::App for MacroNovaApp {
                 ui.selectable_value(&mut self.tab, Tab::Editor, "Editor");
                 ui.selectable_value(&mut self.tab, Tab::Devices, "Devices");
                 ui.selectable_value(&mut self.tab, Tab::Daemon, "Daemon");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(ref msg) = self.status_message {
                         ui.label(egui::RichText::new(msg).color(egui::Color32::LIGHT_GREEN));
@@ -204,6 +210,12 @@ impl eframe::App for MacroNovaApp {
             }
             Tab::Daemon => {
                 self.daemon_view.show(ui);
+            }
+            Tab::Settings => {
+                if let Some(updated_config) = self.settings_view.show(ui, &self.config) {
+                    self.config = updated_config;
+                    self.save_config();
+                }
             }
         });
     }

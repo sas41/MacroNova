@@ -6,12 +6,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::device::evdev_input::discover_evdev_paths;
 
+/// How `warp_mouse(x, y)` emits absolute position events on Linux/Wayland.
+///
+/// The kernel suppresses `EV_ABS` events whose value hasn't changed since the
+/// last report.  `Jitter` works around this by emitting a one-pixel offset first
+/// so every call produces a state change.  `Direct` relies on `INPUT_PROP_DIRECT`
+/// (tablet/touchscreen semantics) which some compositors may treat differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WarpMode {
+    /// Emit `(x, y+1)` then `(x, y)` — works around kernel dedup on all compositors.
+    #[default]
+    Jitter,
+    /// Declare `INPUT_PROP_DIRECT` on the uinput device and emit a single event.
+    Direct,
+}
+
 /// Top-level configuration loaded from `~/.config/macronova/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Per-device configurations, keyed by a user-chosen device name (e.g. "G502X").
     #[serde(default)]
     pub device: HashMap<String, DeviceConfig>,
+
+    /// How `warp_mouse` positions the cursor on Linux/Wayland.
+    /// Defaults to `jitter` (most compatible).
+    #[serde(default)]
+    pub warp_mode: WarpMode,
 }
 
 /// Configuration for a single device.
@@ -153,25 +174,52 @@ impl Config {
     }
 }
 
-/// Returns `~/.config/macronova/`.
+/// Returns the platform-appropriate config base directory joined with `macronova/`.
+///
+/// | Platform | Path                                          |
+/// |----------|-----------------------------------------------|
+/// | Linux    | `$XDG_CONFIG_HOME/macronova` or `~/.config/macronova` |
+/// | Windows  | `%APPDATA%\macronova`                         |
+/// | macOS    | `~/Library/Application Support/macronova`     |
 pub fn default_config_dir() -> PathBuf {
-    dirs_next()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+    platform_config_base()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("macronova")
 }
 
-/// Returns `~/.config/macronova/config.toml`.
+/// Returns `<config_dir>/config.toml`.
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join("config.toml")
 }
 
-/// Returns `~/.config/macronova/macros/`.
+/// Returns `<config_dir>/macros/`.
 pub fn default_macros_dir() -> PathBuf {
     default_config_dir().join("macros")
 }
 
-fn dirs_next() -> Option<PathBuf> {
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn platform_config_base() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_config_base() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_config_base() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "windows",
+    target_os = "macos",
+)))]
+fn platform_config_base() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }

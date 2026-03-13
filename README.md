@@ -1,36 +1,41 @@
+<img src="assets/logo-256.png" alt="MacroNova" width="96" align="right"/>
+
 # MacroNova
 
-A universal macro daemon for Linux. Bind physical mouse and keyboard buttons to
-Rhai scripts — run key sequences, type text, click, scroll, and more.
+A macro daemon for Linux that lets you bind physical mouse and keyboard buttons
+to [Rhai](https://rhai.rs/) scripts — run key sequences, type text, click,
+scroll, warp the cursor, and more.
 
 Currently targets **Logitech G502 X Lightspeed** (USB dongle, wireless) on
-**Linux with KDE Plasma Wayland / KWin**.
+**Linux with KDE Plasma 6 / KWin Wayland**.  Windows and macOS stubs exist in
+the codebase; contributions welcome.
 
 ---
 
 ## Features
 
-- Sniff input from a physical device without interfering with normal OS input
+- Read button events from a physical device without consuming them from the OS —
+  normal pointer and key behaviour is completely unaffected
 - Bind any button to a `.rhai` script via `on_press` and/or `on_release`
-- Scripts run in a sandboxed Rhai engine with a defined API
-- Hold-aware: `held()` returns false when the button is released, so loops
-  terminate cleanly
-- Hot-reload config: edits to `config.toml` take effect immediately without
-  restarting the daemon
-- GUI for managing bindings, capturing button names, and editing scripts
-- Virtual keyboard injection via uinput (works on Wayland through XWayland's
-  `kbd` handler)
-- Mouse injection via the XDG RemoteDesktop portal + EIS (KDE prompts once for
-  permission; subsequent starts reuse the grant automatically)
+- Scripts run in a sandboxed Rhai engine with a clean, stable API
+- Hold-aware: `held()` returns `false` when the button is released, so loops
+  terminate cleanly between cycles
+- Hot-reload: edits to `config.toml` take effect immediately without restarting
+  the daemon
+- GUI for managing bindings, capturing button names, and editing scripts live
+- Virtual keyboard injection via `uinput` (works on Wayland)
+- Absolute cursor warp via `uinput` `EV_ABS` (works on Wayland)
+- Configurable warp mode: **Jitter** (default, most compatible) or **Direct**
+  (`INPUT_PROP_DIRECT`)
 
 ---
 
 ## Requirements
 
 - Linux kernel with `uinput` support (`/dev/uinput`)
-- User must be in the `input` group (for reading evdev nodes)
+- User in the `input` group, or udev rules granting access (see Installation)
 - KDE Plasma 6 / KWin Wayland (X11 and other compositors untested)
-- Rust 1.75+ (uses the 2021 edition)
+- Rust 1.75+ (2021 edition)
 
 ---
 
@@ -40,7 +45,7 @@ Currently targets **Logitech G502 X Lightspeed** (USB dongle, wireless) on
 cargo build --release
 ```
 
-The workspace produces three binaries:
+The workspace produces these binaries:
 
 | Binary | Crate | Purpose |
 |---|---|---|
@@ -48,115 +53,98 @@ The workspace produces three binaries:
 | `macronova-gui` | `macronova-gui` | Configuration GUI |
 | `hidraw-sniffer` | `macronova-daemon` | Debug: print raw HID++ frames |
 | `evdev-sniffer` | `macronova-daemon` | Debug: print raw evdev events |
-| `mouse-test` | `macronova-daemon` | Debug: test EIS mouse click injection |
 
 ---
 
 ## Installation
 
-### udev rule (required)
-
-The evdev nodes for the receiver are owned by `root:input`. Add yourself to the
-`input` group and install the udev rule so that future plugs are accessible
-without sudo:
+Use the release build script and installer:
 
 ```sh
-sudo cp 42-macronova.rules /etc/udev/rules.d/
+publish/linux/build-release.sh
+artifacts/linux-x64/install-macronova.sh
+```
+
+This installs binaries, the `.desktop` file, icons, bundled macros, and
+optionally configures the systemd user service.  No `sudo` required — privileged
+setup (udev rules, systemd) is handled by the **Daemon** tab in the GUI on first
+launch.
+
+### Manual udev rule
+
+```sh
+sudo cp publish/linux/42-macronova.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG input $USER   # re-login after this
 ```
 
-### Daemon
-
-Run manually:
+### Manual daemon start
 
 ```sh
 cargo run -p macronova-daemon
 ```
 
-Or install as a systemd user service:
+Or as a systemd user service:
 
 ```sh
-cp macronova.service ~/.config/systemd/user/
+cp publish/linux/macronova.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now macronova
-```
-
-The service file expects the binary at `~/.cargo/bin/macronova-daemon`:
-
-```sh
-cargo install --path crates/macronova-daemon
+systemctl --user enable --now macronova-daemon
 ```
 
 ---
 
 ## Configuration
 
-Config lives at `~/.config/macronova/config.toml`. See
-`config/example.toml` for a fully commented example.
+Config lives at `~/.config/macronova/config.toml`.
 
 ```toml
 [device.G502X]
 wpid = "407F"
 
 [[device.G502X.bindings]]
-button = "event5/key0x0117"   # sniper button
+button   = "usb-Logitech_USB_Receiver-event-mouse/key0x0117"
 on_press = "macros/undo.rhai"
 
 [[device.G502X.bindings]]
-button = "event5/key0x0115"   # top side button 1
-on_press  = "macros/click_repeat.rhai"
-on_release = "macros/notify_released.rhai"
+button     = "usb-Logitech_USB_Receiver-event-mouse/key0x0115"
+on_press   = "macros/spam_lmb.rhai"
+on_release = "macros/spam_lmb.rhai"
+
+# Wayland cursor warp mode: "jitter" (default) or "direct"
+warp_mode = "jitter"
 ```
 
-Button names use the format `<eventN>/key0x<HHHH>` where `HHHH` is the
-four-digit lowercase EV_KEY hex code. Use the GUI **Capture** button to
-discover the exact name for any physical button.
-
-### Script directory
-
-Scripts are `.rhai` files placed in `~/.config/macronova/macros/`. Paths in
-the config are relative to `~/.config/macronova/`.
+Use the GUI **Capture** button to discover the exact button name for any
+physical key.  See [`SCRIPTING.md`](SCRIPTING.md) for the full API reference.
 
 ---
 
-## Rhai Script API
+## Rhai Script API (quick reference)
 
 ```rhai
 // Keyboard
 press_key("ctrl")       // hold a key down
 release_key("ctrl")     // release a held key
 tap_key("z")            // press + release
-type_text("hello")      // type a string
+type_text("hello")      // type a string character by character
 
-// Mouse (via XDG RemoteDesktop portal + EIS — KDE will prompt once for permission)
+// Mouse
 click("left")           // click a mouse button
 press_mouse("right")    // hold a mouse button down
 release_mouse("right")  // release a mouse button
-move_mouse(10, -5)      // relative cursor movement
-warp_mouse(960, 540)    // absolute cursor warp
+move_mouse(10, -5)      // relative cursor movement (pixels)
+warp_mouse(960, 540)    // absolute cursor warp (logical pixels)
 scroll(3)               // vertical scroll (positive = down)
 hscroll(-1)             // horizontal scroll (positive = right)
 
-// Control
+// Control flow
 sleep(50)               // sleep N milliseconds
 held()                  // true while the trigger button is held
 
+// System
 run_command("notify-send MacroNova fired")
 ```
-
-`held()` is checked at `while` loop boundaries. Loops terminate cleanly after
-the current cycle completes — press/release pairs are never split mid-cycle.
-See **SCRIPTING.md** for the full API reference and key name list.
-
----
-
-## Mouse Injection
-
-Mouse injection uses the **XDG RemoteDesktop portal** (`ConnectToEIS`) backed
-by `xdg-desktop-portal-kde`. On first run KDE shows a one-time permission
-dialog; the grant is persisted so subsequent daemon starts need no interaction.
-See **ARCHITECTURE.md** for implementation details and research history.
 
 ---
 
@@ -164,15 +152,22 @@ See **ARCHITECTURE.md** for implementation details and research history.
 
 ```
 MacroNova/
+  assets/                 # Logo files (PNG + SVG)
   crates/
-    macronova-core/     # config, evdev discovery, device abstractions
-    macronova-daemon/   # main daemon binary + debug sniffers
-    macronova-gui/      # egui configuration GUI
-  config/
-    example.toml        # annotated example configuration
-  macros/               # example .rhai scripts
-  42-macronova.rules    # udev rule for /dev/input access
-  macronova.service     # systemd user service unit
-  ARCHITECTURE.md       # crate and data-flow documentation
-  SCRIPTING.md          # Rhai API reference and key name list
+    macronova-core/       # Config, evdev discovery, platform abstractions
+    macronova-daemon/     # Main daemon binary + debug sniffers
+    macronova-gui/        # egui configuration GUI
+  publish/
+    linux/                # Build + install scripts, .desktop, udev rules, service unit
+    config/               # Example config and bundled macros
+  Guides/                 # Device-specific setup guides
+  ARCHITECTURE.md         # Crate structure, data flow, OS-specific implementation notes
+  SCRIPTING.md            # Full Rhai API reference and key name list
 ```
+
+---
+
+## Guides
+
+See the [`Guides/`](Guides/GUIDES.md) folder for device-specific setup and
+example macro collections.

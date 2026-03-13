@@ -22,6 +22,8 @@ fi
 LIB_ROOT="$HOME/.local/lib/MacroNova"
 BIN_DIR="$HOME/.local/bin"
 APPLICATIONS_DIR="$HOME/.local/share/applications"
+ICONS_256_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+ICONS_SVG_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 MACROS_DEST="$HOME/.config/macronova/macros"
 
 # ── Stop daemon if running ───────────────────────────────────────────────────
@@ -39,6 +41,8 @@ mkdir -p "$LIB_ROOT/MacroNova-Daemon"
 mkdir -p "$LIB_ROOT/MacroNova-GUI"
 mkdir -p "$BIN_DIR"
 mkdir -p "$APPLICATIONS_DIR"
+mkdir -p "$ICONS_256_DIR"
+mkdir -p "$ICONS_SVG_DIR"
 
 # ── Daemon ───────────────────────────────────────────────────────────────────
 cp "$PKG_DIR/MacroNova-Daemon/macronova-daemon"   "$LIB_ROOT/MacroNova-Daemon/macronova-daemon"
@@ -49,15 +53,33 @@ chmod +x "$LIB_ROOT/MacroNova-Daemon/macronova-daemon"
 cp "$PKG_DIR/MacroNova-GUI/macronova-gui" "$LIB_ROOT/MacroNova-GUI/macronova-gui"
 chmod +x "$LIB_ROOT/MacroNova-GUI/macronova-gui"
 
+# ── Icons ────────────────────────────────────────────────────────────────────
+cp "$PKG_DIR/MacroNova-GUI/icons/macronova-256.png" "$ICONS_256_DIR/macronova.png"
+cp "$PKG_DIR/MacroNova-GUI/icons/macronova.svg"     "$ICONS_SVG_DIR/macronova.svg"
+# Refresh icon caches so desktop environments pick up the new icon immediately.
+# GTK / most desktops
+if command -v gtk-update-icon-cache &>/dev/null; then
+    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+fi
+# KDE Plasma 6
+if command -v kbuildsycoca6 &>/dev/null; then
+    kbuildsycoca6 2>/dev/null || true
+# KDE Plasma 5 fallback
+elif command -v kbuildsycoca5 &>/dev/null; then
+    kbuildsycoca5 2>/dev/null || true
+fi
+echo "Installed icons to $ICONS_256_DIR and $ICONS_SVG_DIR"
+
 # ── Symlinks ─────────────────────────────────────────────────────────────────
 ln -sf "$LIB_ROOT/MacroNova-Daemon/macronova-daemon" "$BIN_DIR/macronova-daemon"
 ln -sf "$LIB_ROOT/MacroNova-GUI/macronova-gui"       "$BIN_DIR/macronova-gui"
 echo "Linked executables in $BIN_DIR"
 
 # ── .desktop file ────────────────────────────────────────────────────────────
+# Only patch the Exec= path; Icon= uses the XDG name "macronova" which the
+# desktop environment resolves from the hicolor icon theme automatically.
 sed \
     -e "s|Exec=macronova-gui|Exec=$BIN_DIR/macronova-gui|g" \
-    -e "s|Icon=macronova-gui|Icon=$LIB_ROOT/MacroNova-GUI/macronova-gui|g" \
     "$PKG_DIR/MacroNova-GUI/macronova-gui.desktop" \
     > "$APPLICATIONS_DIR/macronova-gui.desktop"
 chmod +x "$APPLICATIONS_DIR/macronova-gui.desktop"

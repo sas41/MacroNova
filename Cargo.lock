@@ -1951,6 +1951,8 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "wayland-client",
+ "x11-dl",
 ]
 
 [[package]]

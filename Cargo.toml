@@ -21,10 +21,11 @@ anyhow = "1"
 thiserror = "2"
 notify = "7"
 
-# HID
+# HID (linux-native feature is Linux-only; other platforms use hidapi's default backend)
 hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
+
+# Linux-only: raw syscall bindings and evdev input
 libc = "0.2"
-# Input injection
 evdev = "0.13"
 
 # Scripting

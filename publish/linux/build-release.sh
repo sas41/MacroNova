@@ -24,7 +24,7 @@ rm -rf "$OUT_DIR"
 
 # ── Create directory tree ────────────────────────────────────────────────────
 mkdir -p "$PKG_DIR/MacroNova-Daemon/macros"
-mkdir -p "$PKG_DIR/MacroNova-GUI"
+mkdir -p "$PKG_DIR/MacroNova-GUI/icons"
 
 # ── Daemon ───────────────────────────────────────────────────────────────────
 cp "$REPO_DIR/target/release/macronova-daemon"  "$PKG_DIR/MacroNova-Daemon/macronova-daemon"
@@ -35,6 +35,8 @@ cp "$PUBLISH_DIR/config/macros/"*.rhai          "$PKG_DIR/MacroNova-Daemon/macro
 # ── GUI ──────────────────────────────────────────────────────────────────────
 cp "$REPO_DIR/target/release/macronova-gui"     "$PKG_DIR/MacroNova-GUI/macronova-gui"
 cp "$SCRIPT_DIR/macronova-gui.desktop"          "$PKG_DIR/MacroNova-GUI/macronova-gui.desktop"
+cp "$REPO_DIR/assets/logo-256.png"              "$PKG_DIR/MacroNova-GUI/icons/macronova-256.png"
+cp "$REPO_DIR/assets/logo.svg"                  "$PKG_DIR/MacroNova-GUI/icons/macronova.svg"
 
 # ── Install script ───────────────────────────────────────────────────────────
 cp "$SCRIPT_DIR/install-macronova.sh"           "$OUT_DIR/install-macronova.sh"
