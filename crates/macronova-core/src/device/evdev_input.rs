@@ -356,6 +356,16 @@ pub struct EvdevPaths {
     pub kbd_label: String,
 }
 
+/// Candidate input device discovered from `/dev/input/by-id`.
+#[derive(Debug, Clone)]
+pub struct EvdevDeviceCandidate {
+    pub base_name: String,
+    pub mouse_path: String,
+    pub kbd_path: Option<String>,
+    pub mouse_label: String,
+    pub kbd_label: Option<String>,
+}
+
 /// Discover the evdev paths for the Logitech USB Receiver by scanning
 /// `/dev/input/by-id/` for the well-known symlink names.
 ///
@@ -368,35 +378,77 @@ pub fn discover_evdev_paths() -> Option<EvdevPaths> {
         return None;
     }
 
+    fn candidate_score(name_lc: &str) -> i32 {
+        let mut score = 0;
+        if name_lc.contains("logitech") || name_lc.contains("logi") {
+            score += 20;
+        }
+        if name_lc.contains("receiver") || name_lc.contains("bolt") {
+            score += 100;
+        }
+        if name_lc.contains("g502") {
+            score += 50;
+        }
+        // Prefer the non-interface alias if present, but still accept "-ifXX"
+        // entries on systems where that's all we get.
+        if name_lc.contains("-if") {
+            score -= 10;
+        }
+        score
+    }
+
+    fn resolve_canonical_path(
+        entry_path: &std::path::Path,
+        by_id: &std::path::Path,
+    ) -> Option<String> {
+        let target = std::fs::read_link(entry_path).ok()?;
+        let joined = by_id.join(target);
+        let canon = std::fs::canonicalize(&joined).unwrap_or(joined);
+        Some(canon.to_string_lossy().to_string())
+    }
+
     let entries = std::fs::read_dir(by_id).ok()?;
-    let mut mouse: Option<(String, String)> = None; // (path, label)
-    let mut kbd: Option<(String, String)> = None;
+    let mut mouse: Option<(i32, String, String)> = None; // (score, path, label)
+    let mut kbd: Option<(i32, String, String)> = None;
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.contains("Logitech") && name.contains("USB_Receiver") {
-            if name.ends_with("-event-mouse") && !name.contains("-if") {
-                let target = std::fs::read_link(entry.path()).ok()?;
-                let canon = by_id.join(&target);
-                let canon = std::fs::canonicalize(&canon).unwrap_or_else(|_| canon.clone());
-                mouse = Some((canon.to_string_lossy().to_string(), name));
-            } else if name.ends_with("-event-kbd") {
-                let target = std::fs::read_link(entry.path()).ok()?;
-                let canon = by_id.join(&target);
-                let canon = std::fs::canonicalize(&canon).unwrap_or_else(|_| canon.clone());
-                kbd = Some((canon.to_string_lossy().to_string(), name));
+        let name_lc = name.to_ascii_lowercase();
+
+        // Keep discovery broad enough to survive kernel/udev naming changes:
+        // Logitech receivers may appear as USB_Receiver, BOLT_Receiver, and
+        // sometimes only as interface-specific "-ifXX" entries.
+        if !(name_lc.contains("logitech") || name_lc.contains("logi")) {
+            continue;
+        }
+
+        if name_lc.ends_with("-event-mouse") {
+            let Some(path) = resolve_canonical_path(&entry.path(), by_id) else {
+                continue;
+            };
+            let score = candidate_score(&name_lc);
+            if mouse.as_ref().map(|m| score > m.0).unwrap_or(true) {
+                mouse = Some((score, path, name));
+            }
+        } else if name_lc.ends_with("-event-kbd") {
+            let Some(path) = resolve_canonical_path(&entry.path(), by_id) else {
+                continue;
+            };
+            let score = candidate_score(&name_lc);
+            if kbd.as_ref().map(|k| score > k.0).unwrap_or(true) {
+                kbd = Some((score, path, name));
             }
         }
     }
 
     match (mouse, kbd) {
-        (Some((mp, ml)), Some((kp, kl))) => Some(EvdevPaths {
+        (Some((_, mp, ml)), Some((_, kp, kl))) => Some(EvdevPaths {
             mouse_path: mp,
             kbd_path: kp,
             mouse_label: ml,
             kbd_label: kl,
         }),
-        (Some((mp, ml)), None) => Some(EvdevPaths {
+        (Some((_, mp, ml)), None) => Some(EvdevPaths {
             mouse_path: mp,
             kbd_path: String::new(),
             mouse_label: ml,
@@ -404,6 +456,76 @@ pub fn discover_evdev_paths() -> Option<EvdevPaths> {
         }),
         _ => None,
     }
+}
+
+/// Discover all evdev device candidates by grouping by-id `-event-mouse`
+/// symlinks with matching optional `-event-kbd` siblings.
+pub fn list_evdev_device_candidates() -> Vec<EvdevDeviceCandidate> {
+    use std::collections::HashMap;
+
+    let by_id = std::path::Path::new("/dev/input/by-id");
+    if !by_id.exists() {
+        return Vec::new();
+    }
+
+    fn resolve_by_id_path(entry_path: &std::path::Path) -> Option<String> {
+        // Keep the stable /dev/input/by-id symlink path instead of resolving
+        // to /dev/input/eventN so device renumbering across reboot/kernel
+        // updates is handled automatically.
+        Some(entry_path.to_string_lossy().to_string())
+    }
+
+    let Ok(entries) = std::fs::read_dir(by_id) else {
+        return Vec::new();
+    };
+
+    let mut mouse_nodes: HashMap<String, (String, String)> = HashMap::new();
+    let mut kbd_nodes: HashMap<String, (String, String)> = HashMap::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(base) = name.strip_suffix("-event-mouse") {
+            if let Some(path) = resolve_by_id_path(&entry.path()) {
+                mouse_nodes.insert(base.to_string(), (path, name));
+            }
+        } else if let Some(base) = name.strip_suffix("-event-kbd") {
+            if let Some(path) = resolve_by_id_path(&entry.path()) {
+                kbd_nodes.insert(base.to_string(), (path, name));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut keys: Vec<String> = mouse_nodes.keys().cloned().collect();
+    keys.sort();
+
+    for key in keys {
+        let Some((mouse_path, mouse_label)) = mouse_nodes.get(&key).cloned() else {
+            continue;
+        };
+
+        let kbd_variants = [format!("{key}-if01"), key.clone(), format!("{key}-if02")];
+
+        let mut kbd_path = None;
+        let mut kbd_label = None;
+        for k in kbd_variants {
+            if let Some((kp, kl)) = kbd_nodes.get(&k).cloned() {
+                kbd_path = Some(kp);
+                kbd_label = Some(kl);
+                break;
+            }
+        }
+
+        out.push(EvdevDeviceCandidate {
+            base_name: key,
+            mouse_path,
+            kbd_path,
+            mouse_label,
+            kbd_label,
+        });
+    }
+
+    out
 }
 
 #[cfg(test)]

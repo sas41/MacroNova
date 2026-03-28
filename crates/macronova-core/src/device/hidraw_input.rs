@@ -4,6 +4,9 @@
 //! Instead, button events are delivered as standard HID reports on two interfaces,
 //! confirmed from the HID report descriptors:
 //!
+//! Note: this module is for low-level hidraw research/debugging. The daemon input
+//! runtime uses evdev paths configured by the user.
+//!
 //! ## hidraw16 — interface 0 (Mouse, Usage Page 0x0001)
 //! No report ID prefix. Total ~13 bytes.
 //! - Bytes 0-1: **16-bit bitmask** (LE) — one bit per button, buttons 1-16.
