@@ -482,6 +482,15 @@ pub fn list_evdev_device_candidates() -> Vec<EvdevDeviceCandidate> {
     let mut mouse_nodes: HashMap<String, (String, String)> = HashMap::new();
     let mut kbd_nodes: HashMap<String, (String, String)> = HashMap::new();
 
+    fn split_interface_suffix(base: &str) -> (&str, Option<u32>) {
+        if let Some((prefix, if_part)) = base.rsplit_once("-if") {
+            if !if_part.is_empty() && if_part.chars().all(|c| c.is_ascii_digit()) {
+                return (prefix, if_part.parse::<u32>().ok());
+            }
+        }
+        (base, None)
+    }
+
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(base) = name.strip_suffix("-event-mouse") {
@@ -504,17 +513,27 @@ pub fn list_evdev_device_candidates() -> Vec<EvdevDeviceCandidate> {
             continue;
         };
 
-        let kbd_variants = [format!("{key}-if01"), key.clone(), format!("{key}-if02")];
+        // Pair with any keyboard/consumer interface that shares the same
+        // receiver/device base name, regardless of interface numbering.
+        let (mouse_root, _) = split_interface_suffix(&key);
+        let mut kbd_matches: Vec<(u32, String, String)> = kbd_nodes
+            .iter()
+            .filter_map(|(kbd_key, (kp, kl))| {
+                let (kbd_root, kbd_if) = split_interface_suffix(kbd_key);
+                if kbd_root == mouse_root {
+                    Some((kbd_if.unwrap_or(0), kp.clone(), kl.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        kbd_matches.sort_by_key(|(if_idx, _, _)| *if_idx);
 
-        let mut kbd_path = None;
-        let mut kbd_label = None;
-        for k in kbd_variants {
-            if let Some((kp, kl)) = kbd_nodes.get(&k).cloned() {
-                kbd_path = Some(kp);
-                kbd_label = Some(kl);
-                break;
-            }
-        }
+        let (kbd_path, kbd_label) = if let Some((_, kp, kl)) = kbd_matches.into_iter().next() {
+            (Some(kp), Some(kl))
+        } else {
+            (None, None)
+        };
 
         out.push(EvdevDeviceCandidate {
             base_name: key,
